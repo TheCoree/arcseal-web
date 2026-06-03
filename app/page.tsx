@@ -1,65 +1,158 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import React, { useState } from "react";
+
+import ProtectedRoute from "@/app/components/ProtectedRoute";
+import { useAuth } from "@/app/contexts/AuthContext";
+import { useMatchSocket } from "@/app/hooks/useMatchSocket";
+import { getRankInfo } from "@/app/components/RankBadge";
+
+import ProfileHero from "@/app/components/dashboard/ProfileHero";
+import RankProgress from "@/app/components/dashboard/RankProgress";
+import StatsCard from "@/app/components/dashboard/StatsCard";
+import PlayCard from "@/app/components/dashboard/PlayCard";
+import EditProfileDialog from "@/app/components/dashboard/EditProfileDialog";
+import SearchingOverlay from "@/app/components/dashboard/SearchingOverlay";
+
+import DraftScreen from "@/app/components/game/DraftScreen";
+import BattleScreen from "@/app/components/game/BattleScreen";
+import ResultScreen from "@/app/components/game/ResultScreen";
+import RankUpAnimation from "@/app/components/game/RankUpAnimation";
+
+export default function Dashboard() {
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <ProtectedRoute>
+      <DashboardContent />
+    </ProtectedRoute>
+  );
+}
+
+function DashboardContent() {
+  const { user, updateProfile, refreshUser } = useAuth();
+  const [isEditOpen, setIsEditOpen] = useState(false);
+  const [rankUpFromElo, setRankUpFromElo] = useState<number | null>(null);
+
+  const match = useMatchSocket({
+    userId: user?.id,
+    onFinished: refreshUser,
+  });
+
+  // Intercept the "back to base" button so a rank-up celebration plays before
+  // we tear down the result screen. We only intercept when the player actually
+  // crossed a rank threshold upward — a loss that drops them a tier just
+  // returns to lobby silently.
+  const handleReturnHome = () => {
+    const result = match.myResult;
+    if (result && result.elo_change > 0) {
+      const oldElo = result.new_elo - result.elo_change;
+      const oldRank = getRankInfo(oldElo).title;
+      const newRank = getRankInfo(result.new_elo).title;
+      if (oldRank !== newRank) {
+        setRankUpFromElo(oldElo);
+        return;
+      }
+    }
+    match.returnHome();
+  };
+
+  const handleRankUpFinished = () => {
+    setRankUpFromElo(null);
+    match.returnHome();
+  };
+
+  if (!user) return null;
+
+  const isInGame = match.gameState !== "IDLE";
+
+  return (
+    <div className="flex-1 w-full max-w-7xl mx-auto px-4 py-8 sm:px-6 lg:px-8 bg-background relative">
+      {match.gameState === "DRAFT" && match.draft && match.mySide && (
+        <DraftScreen
+          leftPlayer={match.leftPlayer}
+          rightPlayer={match.rightPlayer}
+          draft={match.draft}
+          mySide={match.mySide}
+          onBan={match.banCharacter}
+          onPick={match.pickCharacter}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+      )}
+
+      {match.gameState === "BATTLE" && match.battle && match.mySide && (
+        <BattleScreen
+          leftPlayer={match.leftPlayer}
+          rightPlayer={match.rightPlayer}
+          battle={match.battle}
+          mySide={match.mySide}
+          opponentDisconnected={match.opponentDisconnected}
+          procPulses={match.procPulses}
+          opponentInspect={match.opponentInspect}
+          telegraphs={match.telegraphs}
+          onInspect={match.sendInspect}
+          actions={{
+            activate: match.activateUnit,
+            move: match.moveActiveUnit,
+            attack: match.attackTarget,
+            useAbility: match.useAbility,
+            endTurn: match.endTurn,
+          }}
+        />
+      )}
+
+      {match.gameState === "FINISHED" && (
+        <ResultScreen
+          me={match.mySide === "LEFT" ? match.leftPlayer : match.rightPlayer}
+          opponent={match.mySide === "LEFT" ? match.rightPlayer : match.leftPlayer}
+          myResult={match.myResult}
+          opponentResult={match.opponentResult}
+          onReturnHome={handleReturnHome}
+        />
+      )}
+
+      {rankUpFromElo != null && match.myResult && (
+        <RankUpAnimation
+          fromElo={rankUpFromElo}
+          toElo={match.myResult.new_elo}
+          onContinue={handleRankUpFinished}
+        />
+      )}
+
+      {match.gameState === "SEARCHING" && (
+        <SearchingOverlay user={user} searchTime={match.searchTime} onCancel={match.cancelSearch} />
+      )}
+
+      <div
+        className="space-y-8 transition-all duration-700"
+        style={{
+          opacity: isInGame ? 0 : 1,
+          transform: isInGame ? "scale(0.95)" : "scale(1)",
+          pointerEvents: isInGame ? "none" : "auto",
+          userSelect: isInGame ? "none" : "auto",
+          visibility: isInGame ? "hidden" : "visible",
+        }}
+      >
+        <ProfileHero user={user} onEdit={() => setIsEditOpen(true)} />
+
+        <div className="grid grid-cols-1 gap-8 lg:grid-cols-12">
+          <div className="lg:col-span-7 flex flex-col gap-6">
+            <RankProgress elo={user.elo} />
+            <StatsCard
+              gamesPlayed={user.games_played ?? 0}
+              wins={user.wins ?? 0}
+              losses={user.losses ?? 0}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+          </div>
+          <div className="lg:col-span-5 flex flex-col">
+            <PlayCard onStartSearch={match.startSearch} disabled={!match.isConnected} />
+          </div>
         </div>
-      </main>
+      </div>
+
+      <EditProfileDialog
+        user={user}
+        open={isEditOpen}
+        onOpenChange={setIsEditOpen}
+        onSave={updateProfile}
+      />
     </div>
   );
 }
