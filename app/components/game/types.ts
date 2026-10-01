@@ -81,6 +81,70 @@ export interface UnitState {
   is_dead: boolean;
   // Round number on which a dead unit respawns (null while alive).
   respawn_round: number | null;
+  stats?: UnitStats;
+}
+
+export interface UnitStats {
+  kills: number;
+  deaths: number;
+  damage_dealt: number;
+  damage_taken: number;
+  healing: number;
+}
+
+// Server turn clock, as sent with every room snapshot.
+export interface TurnTimerPayload {
+  seconds: number;
+  remaining_ms: number;
+}
+
+// Client-side clock: absolute local deadline (ms since epoch).
+export interface TurnClock {
+  deadline: number;
+  seconds: number;
+}
+
+// Why a unit changed zone — drives the movement animation.
+export type MoveCause = "walk" | "pull" | "swap" | "dash" | "carry" | "relocate";
+
+// What happened between two snapshots, in order. Sent inside ROOM_STATE.
+export type BattleEvent =
+  | { t: "round"; round: number }
+  | { t: "attack"; unit: string; target: string }
+  | { t: "ability"; unit: string; ability_id: string; target: string | null }
+  | { t: "damage"; src: string | null; dst: string; amount: number; dtype: string }
+  | { t: "heal"; src: string | null; dst: string; amount: number }
+  | {
+      t: "status";
+      src: string;
+      dst: string;
+      name: string;
+      value: number | null;
+      duration: number | null;
+      group?: string | null;
+    }
+  | { t: "move"; unit: string; from: number; to: number; cause: MoveCause; by: string | null }
+  | { t: "death"; unit: string; killer: string | null; respawn_round: number | null }
+  | { t: "respawn"; unit: string; zone: number }
+  | { t: "passive"; unit: string; id?: string; name: string }
+  | { t: "skip"; unit: string; reason: "stun" | "timeout" };
+
+export interface LoggedEvent {
+  key: number;
+  event: BattleEvent;
+}
+
+export type EndReason = "score" | "surrender" | "disconnect" | "afk";
+
+export interface MatchSummary {
+  rounds: number;
+  units: { unit_id: string; char_id: string; owner_side: Side; stats: UnitStats }[];
+}
+
+export interface FinishInfo {
+  reason: EndReason;
+  winner: Side | null;
+  summary: MatchSummary;
 }
 
 export interface BattleSnapshot {
@@ -156,5 +220,6 @@ export interface PassiveDef {
   description?: string | null;
   icon_url?: string | null;
   trigger_event: string;
+  conditions?: NonNullable<ChainStep["conditions"]>;
   execution_chain?: ChainStep[];
 }

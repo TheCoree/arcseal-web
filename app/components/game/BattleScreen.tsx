@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Heart, Maximize2, Minus, Plus, Shield, Sparkles, Zap } from "lucide-react";
+import { Eye, Heart, Keyboard, Maximize2, Minus, Plus, Shield, Skull, Sparkles, Zap } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
@@ -12,17 +12,28 @@ import {
 } from "@/components/ui/tooltip";
 import { RankBadge } from "@/app/components/RankBadge";
 import { CharacterDetail } from "@/app/components/game/CharacterDetail";
+import { BattleLog } from "@/app/components/game/BattleLog";
+import { SurrenderButton } from "@/app/components/game/SurrenderButton";
+import { TurnTimer } from "@/app/components/game/TurnTimer";
+import { RingStatusPips, StatusChips, TEXT_TONE } from "@/app/components/game/StatusChips";
+import { describeStatus, groupStatuses, turnsLeft, type StatusTone } from "@/app/components/game/statusInfo";
+import type { LucideIcon } from "lucide-react";
+import { previewAbility, previewAttack, type HitPreview } from "@/app/components/game/damagePreview";
+import { useTokenMotion } from "@/app/components/game/useTokenMotion";
 import { useCharacterRoster } from "@/app/hooks/useCharacterRoster";
-import type { TelegraphEvent } from "@/app/hooks/useMatchSocket";
+import type { OpponentIntent, TelegraphEvent } from "@/app/hooks/useMatchSocket";
 import { absolutizeAvatarUrl, absolutizeMediaUrl, cn } from "@/lib/utils";
 import type {
   AbilityDef,
+  BattleEvent,
   BattleSnapshot,
   CharacterDef,
+  LoggedEvent,
   PassiveDef,
   PlayerInfo,
   Side,
   StatusEffect,
+  TurnClock,
   UnitState,
 } from "@/app/components/game/types";
 
@@ -40,6 +51,7 @@ interface BattleActions {
   attack: (targetUnitId: string) => void;
   useAbility: (target: { abilityId?: string; unitId?: string; unitId2?: string; zone?: number }) => void;
   endTurn: () => void;
+  surrender: () => void;
 }
 
 interface BattleScreenProps {
@@ -47,13 +59,17 @@ interface BattleScreenProps {
   rightPlayer: PlayerInfo | null;
   battle: BattleSnapshot;
   mySide: Side;
+  turnClock?: TurnClock | null;
+  // Full match log, and the batch that came with the current snapshot.
+  battleLog?: LoggedEvent[];
+  eventBatch?: { key: number; events: BattleEvent[] } | null;
   opponentDisconnected?: boolean;
   // Transient passive-proc pulses keyed by unit_id (from the socket).
   procPulses?: Record<string, { name: string; key: number }>;
-  // unit_id the opponent is inspecting (telegraph), and the action feed.
-  opponentInspect?: string | null;
+  // What the opponent is currently doing (telegraph), and the action feed.
+  opponentIntent?: OpponentIntent | null;
   telegraphs?: TelegraphEvent[];
-  onInspect?: (unitId: string | null) => void;
+  onIntent?: (intent: OpponentIntent | null) => void;
   actions: BattleActions;
 }
 
@@ -93,16 +109,32 @@ const EMPTY_STRING_SET: ReadonlySet<string> = new Set<string>();
 // Deterministic per-unit offset/rotation so units in the same zone read as
 // "placed" rather than ruler-stacked. Same unit_id always produces the same
 // scatter (so tokens don't jitter on re-render).
-function tokenScatter(uid: string): { x: number; y: number; rotate: number } {
+function tokenHash(uid: string): number {
   let h = 0;
   for (let i = 0; i < uid.length; i++) {
     h = (h * 31 + uid.charCodeAt(i)) >>> 0;
   }
+  return h;
+}
+
+function tokenScatter(uid: string): { x: number; y: number; rotate: number } {
+  const h = tokenHash(uid);
   return {
-    x: ((h % 9) - 4) * 2,        // ±8 px
-    y: (((h >> 4) % 7) - 3) * 1.5, // ±4.5 px
+    x: ((h % 11) - 5) * 2.2,        // ±11 px
+    y: (((h >> 4) % 7) - 3) * 1.5,  // ±4.5 px
     rotate: (((h >> 8) % 7) - 3) * 0.9, // ±2.7°
   };
+}
+
+// Split a zone's units into two staggered rows so the formation is wider and
+// less tall, and reads as chaotic rather than a neat single file. Ordered by
+// hash so left/right placement looks random while the two rows stay balanced.
+function splitZoneRows(uids: string[]): [string[], string[]] {
+  const sorted = [...uids].sort((a, b) => tokenHash(a) - tokenHash(b));
+  const top: string[] = [];
+  const bottom: string[] = [];
+  sorted.forEach((u, i) => (i % 2 === 0 ? top : bottom).push(u));
+  return [top, bottom];
 }
 
 // Walk a chain to decide what kind of target the ability needs from the
@@ -166,39 +198,162 @@ function getAbilityTargetingKind(ability: AbilityDef): TargetingKind {
   return scanChainForTargeting(ability.execution_chain, ability);
 }
 
+// The targeting mode an ability opens, or null if it fires without a target.
+// `rangeBonus` is the caster's ABILITY_RANGE aura (Starlink).
+function abilityTargeting(ability: AbilityDef, rangeBonus: number): Targeting {
+  const kind = getAbilityTargetingKind(ability);
+  const abilityId = ability.id;
+  const flt = (k?: string) => k as "ALLIES" | "ENEMIES" | "ALL" | undefined;
+  switch (kind.kind) {
+    case "none":
+      return null;
+    case "unit":
+      return {
+        kind: "ABILITY_UNIT",
+        abilityId,
+        filter: flt(kind.filter),
+        range: kind.range === undefined ? undefined : kind.range + rangeBonus,
+      };
+    case "unit_then_zone":
+      return {
+        kind: "ABILITY_UNIT_THEN_ZONE",
+        abilityId,
+        filter: flt(kind.filter) ?? "ALLIES",
+        castRange: kind.castRange + rangeBonus,
+        moveRange: kind.moveRange,
+      };
+    case "two_units":
+      return { kind: "ABILITY_TWO_UNITS", abilityId, filter: flt(kind.filter) ?? "ALLIES", range: kind.range + rangeBonus };
+    default:
+      return { kind: "ABILITY_ZONE", abilityId, range: kind.range + rangeBonus };
+  }
+}
+
+// What a not-yet-activated unit will look like once activated: energy regen
+// in, cooldowns one lower. Lets the panel offer "activate and cast" honestly.
+function projectActivation(unit: UnitState, char: CharacterDef): UnitState {
+  return {
+    ...unit,
+    current_energy: Math.min(unit.max_energy, unit.current_energy + char.base_stats.energy_regen),
+    cooldowns: Object.fromEntries(Object.entries(unit.cooldowns).map(([k, v]) => [k, Math.max(0, v - 1)])),
+  };
+}
+
+function willSkipWhenActivated(unit: UnitState): boolean {
+  return unit.statuses.some((s) => s.name === "STUN") && !unit.statuses.some((s) => s.name === "DEBUFF_IMMUNE");
+}
+
 // ── Damage feedback hooks ─────────────────────────────────────────────
-// Detect HP drops between renders and surface a one-shot flash event. The
-// `key` lets consumers force-remount visual elements so CSS animations
-// restart on every hit.
-function useHpDamageFlash(currentHp: number): { value: number; key: number } | null {
-  const [flash, setFlash] = useState<{ value: number; key: number } | null>(null);
+// Detect HP changes between renders and surface a one-shot flash event: a
+// drop is a hit, a rise a heal (a respawn from 0 HP is neither). The `key`
+// lets consumers force-remount visual elements so CSS animations restart.
+type HpFlash = { value: number; key: number; heal: boolean };
+
+function useHpChangeFlash(currentHp: number): HpFlash | null {
+  const [flash, setFlash] = useState<HpFlash | null>(null);
   const prevRef = useRef(currentHp);
   useEffect(() => {
     const prev = prevRef.current;
     prevRef.current = currentHp;
-    if (currentHp < prev) {
-      const k = performance.now();
-      setFlash({ value: prev - currentHp, key: k });
-      const timer = setTimeout(() => {
-        setFlash((curr) => (curr?.key === k ? null : curr));
-      }, 1100);
-      return () => clearTimeout(timer);
-    }
+    if (currentHp === prev || prev <= 0) return;
+    const k = performance.now();
+    setFlash({ value: Math.abs(currentHp - prev), key: k, heal: currentHp > prev });
+    const timer = setTimeout(() => {
+      setFlash((curr) => (curr?.key === k ? null : curr));
+    }, 1100);
+    return () => clearTimeout(timer);
   }, [currentHp]);
   return flash;
 }
 
+// Hit flash only (heals don't shake or flash red).
+function useHpDamageFlash(currentHp: number): { hit: HpFlash | null; heal: HpFlash | null } {
+  const change = useHpChangeFlash(currentHp);
+  return { hit: change && !change.heal ? change : null, heal: change?.heal ? change : null };
+}
+
+// Floating green "+N" for heals, shared by field tokens and strip cards.
+function HealFloat({ heal, className }: { heal: HpFlash; className?: string }) {
+  return (
+    <div
+      className={cn(
+        "absolute left-1/2 text-3xl font-black text-green-300 pointer-events-none select-none whitespace-nowrap z-30",
+        className,
+      )}
+      style={{
+        animation: "dmg-float 1.15s cubic-bezier(0.2, 0.6, 0.2, 1) forwards",
+        textShadow: "0 3px 10px rgba(0,0,0,0.9), 0 0 6px rgba(34,197,94,0.85), 0 0 18px rgba(34,197,94,0.4)",
+      }}
+    >
+      +{heal.value}
+    </div>
+  );
+}
+
+// An effect that just landed on a unit, floated over its token once.
+type StatusPulse = { name: string; tone: StatusTone; Icon: LucideIcon; key: number };
+
+// Damage forecast over a hovered target's portrait: the portrait darkens and
+// shows the hit in italics — or a skull when the hit kills. `upTo` adds what
+// random procs (e.g. a 35% double strike) could deal on top.
+function PreviewOverlay({ preview, large }: { preview: HitPreview; large?: boolean }) {
+  return (
+    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/65 pointer-events-none animate-in fade-in-0 duration-150">
+      {preview.lethal ? (
+        <Skull
+          className={cn("text-red-500", large ? "h-12 w-12" : "h-1/2 w-1/2")}
+          style={{ filter: "drop-shadow(0 0 8px rgba(239,68,68,0.85))" }}
+        />
+      ) : (
+        <span
+          className={cn(
+            "font-black italic leading-none text-red-200",
+            large ? "text-4xl" : "text-lg sm:text-xl lg:text-2xl xl:text-3xl",
+          )}
+          style={{ textShadow: "0 2px 8px rgba(0,0,0,0.9), 0 0 10px rgba(239,68,68,0.7)" }}
+        >
+          −{preview.amount}
+        </span>
+      )}
+      {!preview.lethal && preview.upTo != null && (
+        <span className="mt-0.5 whitespace-nowrap text-[9px] lg:text-[11px] font-bold italic text-red-300/85">
+          до −{preview.upTo}
+          {preview.maybeLethal ? " ☠" : ""}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Action availability for the active unit — shared by the detail panel
+// buttons and the keyboard shortcuts so both always agree with the server.
+function canAttackNow(unit: UnitState, stunned: boolean): boolean {
+  return !stunned && !unit.has_attacked && !unit.has_used_ability;
+}
+
+function canMoveNow(unit: UnitState, stunned: boolean): boolean {
+  return !stunned && unit.move_count < 1;
+}
+
+function canUseNow(unit: UnitState, ability: AbilityDef, stunned: boolean): boolean {
+  if (stunned) return false;
+  const cost = Math.max(0, ability.energy_cost + (unit.modifiers?.ABILITY_COST ?? 0));
+  if (unit.current_energy < cost) return false;
+  if ((unit.cooldowns[ability.id] ?? 0) > 0) return false;
+  // Non-quick abilities are locked out only by having attacked (not by other
+  // abilities) — so you can chain as many as energy/cooldowns allow.
+  return ability.is_quick || !unit.has_attacked;
+}
+
 // Surface a passive proc as a one-shot flash. Mirrors useHpDamageFlash: when
 // the incoming pulse's `key` changes, hold the label for ~1.6s then clear.
-function useProcFlash(
-  pulse: { name: string; key: number } | undefined,
-): { name: string; key: number } | null {
-  const [flash, setFlash] = useState<{ name: string; key: number } | null>(null);
+function useProcFlash<T extends { key: number }>(pulse: T | undefined): T | null {
+  const [flash, setFlash] = useState<T | null>(null);
   const prevKey = useRef<number | null>(null);
   useEffect(() => {
     if (!pulse || pulse.key === prevKey.current) return;
     prevKey.current = pulse.key;
-    setFlash({ name: pulse.name, key: pulse.key });
+    setFlash(pulse);
     const timer = setTimeout(() => {
       setFlash((curr) => (curr?.key === pulse.key ? null : curr));
     }, 1600);
@@ -242,223 +397,6 @@ function zoneLabel(zoneIndex: number): string {
 
 function charInitial(name?: string): string {
   return (name?.trim() ?? "?").slice(0, 1).toUpperCase();
-}
-
-// Friendly RU labels for internal status tags. Falls back to the raw name so
-// a freshly-added status still renders something readable.
-const STATUS_LABEL_RU: Record<string, string> = {
-  ISOLATION: "Изоляция",
-  STUN: "Оглушение",
-  POISON: "Яд",
-  REGEN: "Реген",
-  MARK_BOMB: "Метка",
-  BUFF_DEFENSE: "Защита+",
-  BUFF_REGENERATION: "Реген+",
-  BUFF_DAMAGE: "Урон+",
-  BUFF_ATTACK_DAMAGE: "Урон атаки+",
-  RESOLVE: "Стойкость",
-  HELL_WEEK: "Hell Week",
-  DEBUFF_IMMUNE: "Иммунитет к дебаффам",
-  ISO_IMMUNE: "Имм. к изоляции",
-};
-
-function statusLabel(name: string): string {
-  return STATUS_LABEL_RU[name] ?? name;
-}
-
-// Short 2–3 char code shown inside the status badge ring.
-const STATUS_SHORT_RU: Record<string, string> = {
-  ISOLATION: "Изо",
-  STUN: "Огл",
-  POISON: "Яд",
-  REGEN: "Рег",
-  MARK_BOMB: "Мет",
-  BUFF_DEFENSE: "Защ",
-  BUFF_REGENERATION: "Рг+",
-  BUFF_DAMAGE: "Ур+",
-  BUFF_ATTACK_DAMAGE: "Ат+",
-  RESOLVE: "Стк",
-  HELL_WEEK: "Ад",
-  DEBUFF_IMMUNE: "Имм",
-  ISO_IMMUNE: "Изо✓",
-};
-function statusShort(name: string): string {
-  return STATUS_SHORT_RU[name] ?? name.slice(0, 3);
-}
-
-// Buffs read as "good" (green); debuffs (POISON/STUN/ISOLATION/MARK_BOMB) red.
-const GOOD_STATUSES = new Set(["RESOLVE", "HELL_WEEK", "DEBUFF_IMMUNE", "ISO_IMMUNE"]);
-function statusIsGood(name: string): boolean {
-  return name.startsWith("BUFF_") || name === "REGEN" || GOOD_STATUSES.has(name);
-}
-
-// Counter-style statuses show their stack value, not a duration ring.
-const STACK_STATUSES = new Set(["RESOLVE"]);
-
-// A single status rendered as a coloured ring (green=buff, red=debuff) whose
-// arc shows the remaining duration. The short code sits in the centre; the
-// full name + turns left live in the tooltip. Gaps keep many effects readable.
-// A negative BUFF_DEFENSE is a defense-shred debuff, not a buff.
-function statusEffectIsGood(s: StatusEffect): boolean {
-  if (s.name === "BUFF_DEFENSE") return (s.value ?? 0) >= 0;
-  return statusIsGood(s.name);
-}
-function isDebuffStatus(s: StatusEffect): boolean {
-  return !statusEffectIsGood(s);
-}
-// Sign-aware label for the shred case.
-function statusLabelOf(s: StatusEffect): string {
-  if (s.name === "BUFF_DEFENSE" && (s.value ?? 0) < 0) return "Защита−";
-  return statusLabel(s.name);
-}
-
-function StatusBadge({ status, dimmed }: { status: StatusEffect; dimmed?: boolean }) {
-  const good = statusEffectIsGood(status);
-  const color = good ? "#34d399" : "#fb7185"; // emerald-400 / rose-400
-  const remaining = status.duration;
-  const permanent = remaining < 0;
-  const total = status.max_duration ?? (remaining > 0 ? remaining : 1);
-  // Stack counters fill their ring by value/max and show the count big.
-  const isStack = STACK_STATUSES.has(status.name);
-  const frac = isStack
-    ? (status.max_duration ? Math.max(0, Math.min(1, (status.value ?? 0) / status.max_duration)) : 1)
-    : permanent
-    ? 1
-    : total > 0
-    ? Math.max(0, Math.min(1, remaining / total))
-    : 0;
-  const VB = 36;
-  const stroke = 3;
-  const r = (VB - stroke) / 2;
-  const C = 2 * Math.PI * r;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div
-          className={cn(
-            "relative h-9 w-9 shrink-0 transition-opacity",
-            dimmed && "opacity-30 grayscale",
-          )}
-        >
-          <svg viewBox={`0 0 ${VB} ${VB}`} className="absolute inset-0 w-full h-full -rotate-90">
-            <circle cx={VB / 2} cy={VB / 2} r={r} fill="rgba(0,0,0,0.45)" stroke="rgba(255,255,255,0.10)" strokeWidth={stroke} />
-            <circle
-              cx={VB / 2} cy={VB / 2} r={r} fill="none" stroke={color} strokeWidth={stroke}
-              strokeDasharray={C} strokeDashoffset={C * (1 - frac)} strokeLinecap="round"
-              style={{ transition: "stroke-dashoffset 0.4s ease" }}
-            />
-          </svg>
-          <div className="absolute inset-0 flex items-center justify-center">
-            <span
-              className={cn("font-black leading-none", isStack ? "text-xs" : "text-[9px]")}
-              style={{ color }}
-            >
-              {isStack ? (status.value ?? 0) : statusShort(status.name)}
-            </span>
-          </div>
-        </div>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="bg-zinc-900 text-zinc-100 border border-zinc-700 text-[11px]">
-        <span className={good ? "text-emerald-300" : "text-rose-300"}>{statusLabelOf(status)}</span>
-        {isStack ? (
-          <span className="text-zinc-400">
-            {" · "}{status.value ?? 0}{status.max_duration ? `/${status.max_duration}` : ""} стак.
-          </span>
-        ) : (
-          <>
-            {!permanent && <span className="text-zinc-400"> · {remaining}т</span>}
-            {permanent && <span className="text-zinc-400"> · ∞</span>}
-            {!!status.value && <span className="text-zinc-400"> · сила {status.value}</span>}
-          </>
-        )}
-        {dimmed && <span className="text-emerald-400"> · подавлено</span>}
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-// Composite badge: collapses a multi-effect ability (e.g. Hell Week) into one
-// violet badge. Tooltip lists every sub-effect.
-function GroupBadge({ group, members }: { group: string; members: StatusEffect[] }) {
-  const color = "#a78bfa"; // violet-400 — "special" composite effect
-  const marker = members.find((m) => m.name === group) ?? members[0];
-  const remaining = marker.duration;
-  const permanent = remaining < 0;
-  const total = marker.max_duration ?? (remaining > 0 ? remaining : 1);
-  const frac = permanent ? 1 : total > 0 ? Math.max(0, Math.min(1, remaining / total)) : 0;
-  const VB = 36, stroke = 3, r = (VB - stroke) / 2, C = 2 * Math.PI * r;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div className="relative h-9 w-9 shrink-0">
-          <svg viewBox={`0 0 ${VB} ${VB}`} className="absolute inset-0 w-full h-full -rotate-90">
-            <circle cx={VB / 2} cy={VB / 2} r={r} fill="rgba(0,0,0,0.45)" stroke="rgba(255,255,255,0.10)" strokeWidth={stroke} />
-            <circle
-              cx={VB / 2} cy={VB / 2} r={r} fill="none" stroke={color} strokeWidth={stroke}
-              strokeDasharray={C} strokeDashoffset={C * (1 - frac)} strokeLinecap="round"
-              style={{ transition: "stroke-dashoffset 0.4s ease" }}
-            />
-          </svg>
-          <div className="absolute inset-0 flex items-center justify-center">
-            <span className="text-[9px] font-black leading-none" style={{ color }}>
-              {statusShort(group)}
-            </span>
-          </div>
-        </div>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="bg-zinc-900 text-zinc-100 border border-zinc-700 text-[11px] max-w-[200px]">
-        <p className="text-violet-300 font-bold">
-          {statusLabel(group)}
-          {!permanent && <span className="text-zinc-400 font-normal"> · {remaining}т</span>}
-        </p>
-        <ul className="mt-0.5 space-y-0.5 text-zinc-300">
-          {members
-            .filter((m) => m.name !== group)
-            .map((m, i) => (
-              <li key={i}>
-                {statusLabelOf(m)}
-                {!!m.value && m.name !== "DEBUFF_IMMUNE" && <span className="text-zinc-400"> {m.value > 0 ? "+" : ""}{m.value}</span>}
-              </li>
-            ))}
-        </ul>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-// Render a unit's statuses: collapse grouped ones into composite badges, and
-// dim debuffs while the unit is debuff-immune (they're suppressed, not gone).
-function StatusRow({ statuses, className }: { statuses: StatusEffect[]; className?: string }) {
-  if (!statuses.length) return null;
-  const immune = statuses.some((s) => s.name === "DEBUFF_IMMUNE");
-  const groups = new Map<string, StatusEffect[]>();
-  const singles: StatusEffect[] = [];
-  for (const s of statuses) {
-    if (s.group) {
-      const arr = groups.get(s.group);
-      if (arr) arr.push(s);
-      else groups.set(s.group, [s]);
-    } else {
-      singles.push(s);
-    }
-  }
-  return (
-    // Single row with horizontal scroll (no wrap to a 2nd line); scrollbar
-    // hidden — scroll via wheel/drag.
-    <div
-      className={cn(
-        "flex flex-nowrap gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-        className,
-      )}
-    >
-      {Array.from(groups.entries()).map(([g, members]) => (
-        <GroupBadge key={`g-${g}`} group={g} members={members} />
-      ))}
-      {singles.map((s, i) => (
-        <StatusBadge key={`s-${s.name}-${i}`} status={s} dimmed={immune && isDebuffStatus(s)} />
-      ))}
-    </div>
-  );
 }
 
 // HP ring: full circle at max HP, shrinks clockwise as HP drops. Colour is
@@ -575,7 +513,10 @@ function UnitToken({
   isClickable,
   isBeingDragged,
   procPulse,
-  inspectedByOpp,
+  statusPulse,
+  isLinked,
+  onHoverChange,
+  preview,
   onClick,
   onPointerDown,
   onPointerMove,
@@ -585,6 +526,14 @@ function UnitToken({
   char: CharacterDef | undefined;
   activation: TokenActivation;
   isMine: boolean;
+  // Predicted damage of the pending attack/ability on this target.
+  preview?: HitPreview | null;
+  // An effect that just landed on this unit — pops over the token once.
+  statusPulse?: StatusPulse;
+  // Hovering this token or its hero card lights up both, so it's always
+  // clear which card (and which effects) belong to which token.
+  isLinked?: boolean;
+  onHoverChange?: (hovered: boolean) => void;
   // Outer "you're inspecting this one" indicator. Always faint; separate
   // from `activation` so a non-active unit can still glow gently when the
   // player has its cards open. The active unit gets the strong amber pulse
@@ -594,7 +543,6 @@ function UnitToken({
   isClickable?: boolean;
   isBeingDragged?: boolean;
   procPulse?: { name: string; key: number };
-  inspectedByOpp?: boolean;
   onClick?: () => void;
   onPointerDown?: (e: React.PointerEvent<HTMLDivElement>) => void;
   onPointerMove?: (e: React.PointerEvent<HTMLDivElement>) => void;
@@ -602,6 +550,7 @@ function UnitToken({
 }) {
   const dead = unit.current_hp <= 0;
   const proc = useProcFlash(procPulse);
+  const statusFlash = useProcFlash(statusPulse);
   const hasStun = unit.statuses.some((s) => s.name === "STUN");
   const hasPoison = unit.statuses.some((s) => s.name === "POISON");
   const stats = char?.base_stats;
@@ -612,9 +561,13 @@ function UnitToken({
     : "";
 
   const portrait = absolutizeMediaUrl(char?.portrait_url ?? null);
-  const flash = useHpDamageFlash(unit.current_hp);
+  const { hit: flash, heal } = useHpDamageFlash(unit.current_hp);
   const shakeRef = useRef<HTMLDivElement>(null);
   useDamageShake(shakeRef, flash?.key);
+  // The damage forecast only shows while the cursor is on this target, so
+  // neighbouring tokens never cover each other's numbers.
+  const [hovered, setHovered] = useState(false);
+  const showPreview = hovered && !!preview && !dead;
 
   return (
     <Tooltip>
@@ -629,6 +582,14 @@ function UnitToken({
             // Hide the original token while its ghost is following the cursor.
             isBeingDragged && "opacity-25",
           )}
+          onPointerEnter={() => {
+            setHovered(true);
+            onHoverChange?.(true);
+          }}
+          onPointerLeave={() => {
+            setHovered(false);
+            onHoverChange?.(false);
+          }}
           onPointerDown={onPointerDown ?? ((e) => e.stopPropagation())}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -679,6 +640,10 @@ function UnitToken({
               }}
             />
           )}
+          {/* Linked with its hero card (one of the two is hovered). */}
+          {isLinked && !dead && (
+            <div className="absolute -inset-2.5 rounded-full border-2 border-sky-300 shadow-[0_0_18px_rgba(125,211,252,0.6)] pointer-events-none" />
+          )}
           {/* Valid-target outline during attack-targeting mode. */}
           {isValidTarget && !dead && (
             <div className="absolute -inset-3 rounded-full border-2 border-amber-300 animate-pulse pointer-events-none" />
@@ -714,6 +679,7 @@ function UnitToken({
               {!dead && hasPoison && (
                 <div className="absolute inset-0 bg-emerald-500/35 mix-blend-hard-light pointer-events-none" />
               )}
+              {showPreview && <PreviewOverlay preview={preview} />}
             </div>
             {/* Stun → dizzy marker above the token. */}
             {!dead && hasStun && (
@@ -721,17 +687,7 @@ function UnitToken({
                 💫
               </div>
             )}
-            {/* Opponent is currently inspecting this unit. */}
-            {inspectedByOpp && (
-              <div className="absolute -bottom-1 -left-1 text-xs leading-none pointer-events-none select-none drop-shadow" title="Соперник смотрит">
-                👁
-              </div>
-            )}
-            {unit.statuses.length > 0 && (
-              <span className="absolute -top-1 -right-1 h-4 min-w-4 px-1 rounded-full bg-violet-500 text-[9px] font-bold text-white flex items-center justify-center">
-                {unit.statuses.length}
-              </span>
-            )}
+            {!dead && <RingStatusPips statuses={unit.statuses} />}
 
             {/* Red flash overlay on the avatar disk. */}
             {flash && (
@@ -773,6 +729,38 @@ function UnitToken({
             >
               -{flash.value}
             </div>
+          )}
+          {heal && <HealFloat key={`heal-${heal.key}`} heal={heal} className="-top-2" />}
+          {statusFlash && !dead && (
+            <>
+              <div
+                key={`status-ring-${statusFlash.key}`}
+                className={cn(
+                  "absolute -inset-2 rounded-full border-[3px] pointer-events-none",
+                  statusFlash.tone === "good"
+                    ? "border-emerald-400"
+                    : statusFlash.tone === "bad"
+                    ? "border-rose-500"
+                    : "border-violet-400",
+                )}
+                style={{ animation: "dmg-shockwave 0.9s cubic-bezier(0.2, 0.6, 0.2, 1) forwards" }}
+              />
+              <div
+                key={`status-${statusFlash.key}`}
+                className={cn(
+                  "absolute left-1/2 top-1/2 z-40 flex items-center gap-1 whitespace-nowrap border-2 px-2 py-0.5 text-sm lg:text-base font-black pointer-events-none select-none shadow-[0_6px_24px_rgba(0,0,0,0.85)]",
+                  statusFlash.tone === "good"
+                    ? "border-emerald-400 bg-emerald-950/95 text-emerald-200"
+                    : statusFlash.tone === "bad"
+                    ? "border-rose-400 bg-rose-950/95 text-rose-200"
+                    : "border-violet-400 bg-violet-950/95 text-violet-200",
+                )}
+                style={{ animation: "status-pop 1.6s ease-out forwards" }}
+              >
+                <statusFlash.Icon className="h-4 w-4 shrink-0" />
+                {statusFlash.name}
+              </div>
+            </>
           )}
 
           {/* Passive proc flash: golden ring pulse + floating passive name. */}
@@ -848,17 +836,21 @@ function UnitToken({
         {unit.statuses.length > 0 && (
           <div className="border-t border-zinc-700 pt-1.5">
             <p className="text-[10px] text-amber-600/80 mb-1">Эффекты</p>
-            <div className="flex flex-wrap gap-1">
-              {unit.statuses.map((s, i) => (
-                <span
-                  key={i}
-                  className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700"
-                >
-                  {statusLabel(s.name)}
-                  {s.duration > 0 ? ` ${s.duration}т` : " ∞"}
-                </span>
-              ))}
-            </div>
+            <ul className="space-y-1">
+              {groupStatuses(unit.statuses).map((group) => {
+                const info = describeStatus(group.head);
+                const left = turnsLeft(group.head);
+                return (
+                  <li key={group.key} className="flex items-start gap-1.5 text-[11px] leading-snug">
+                    <info.Icon className={cn("mt-0.5 h-3 w-3 shrink-0", TEXT_TONE[info.tone])} />
+                    <span>
+                      <span className={cn("font-bold", TEXT_TONE[info.tone])}>{info.title}</span>
+                      {left && <span className="text-zinc-500"> · {left}</span>}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         )}
 
@@ -884,6 +876,9 @@ function UnitCard({
   activation,
   isValidTarget,
   isClickable,
+  preview,
+  isLinked,
+  onHoverChange,
   onClick,
 }: {
   unit: UnitState;
@@ -891,6 +886,9 @@ function UnitCard({
   activation?: TokenActivation;
   isValidTarget?: boolean;
   isClickable?: boolean;
+  preview?: HitPreview | null;
+  isLinked?: boolean;
+  onHoverChange?: (hovered: boolean) => void;
   onClick?: () => void;
 }) {
   const dead = unit.current_hp <= 0;
@@ -902,20 +900,32 @@ function UnitCard({
     : "";
 
   const portrait = absolutizeMediaUrl(char?.portrait_url ?? null);
-  const flash = useHpDamageFlash(unit.current_hp);
+  const { hit: flash, heal } = useHpDamageFlash(unit.current_hp);
   const shakeRef = useRef<HTMLDivElement>(null);
   useDamageShake(shakeRef, flash?.key);
+  const [hovered, setHovered] = useState(false);
+  const showPreview = hovered && !!preview && !dead;
 
   return (
     <div
       ref={shakeRef}
+      onPointerEnter={() => {
+        setHovered(true);
+        onHoverChange?.(true);
+      }}
+      onPointerLeave={() => {
+        setHovered(false);
+        onHoverChange?.(false);
+      }}
       onClick={isClickable && onClick ? (e) => { e.stopPropagation(); onClick(); } : undefined}
       className={cn(
         "relative flex border bg-card/60 backdrop-blur-sm overflow-hidden transition-all shrink-0",
         dead && "opacity-40 grayscale",
         isClickable && "cursor-pointer",
         // Border / glow ring for activation state and attack targeting.
-        isValidTarget
+        isLinked
+          ? "border-sky-300 shadow-[0_0_20px_rgba(125,211,252,0.45)]"
+          : isValidTarget
           ? "border-amber-300 shadow-[0_0_22px_rgba(252,211,77,0.45)] animate-pulse"
           : activation === "current"
           ? "border-amber-400 shadow-[0_0_18px_rgba(252,211,77,0.35)]"
@@ -963,6 +973,7 @@ function UnitCard({
         )}
         {/* Soft bottom shade so a future cover image keeps the inner edge readable */}
         <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/40 to-transparent" />
+        {showPreview && <PreviewOverlay preview={preview} large />}
 
         {/* Hit flash + floating damage number on the strip card portrait. */}
         {flash && (
@@ -986,6 +997,7 @@ function UnitCard({
             -{flash.value}
           </div>
         )}
+        {heal && <HealFloat key={`card-heal-${heal.key}`} heal={heal} className="top-2 text-4xl" />}
       </div>
 
       <div className="flex-1 min-w-0 px-3 py-2.5 flex flex-col gap-2">
@@ -1041,7 +1053,7 @@ function UnitCard({
         </div>
 
         {unit.statuses.length > 0 && (
-          <StatusRow statuses={unit.statuses} className="mt-auto pt-1" />
+          <StatusChips statuses={unit.statuses} className="mt-auto pt-1" />
         )}
       </div>
     </div>
@@ -1054,6 +1066,8 @@ function PlayerStrip({
   byId,
   disconnected,
   label,
+  showActivity,
+  activity,
   getCardProps,
 }: {
   player: PlayerInfo | null;
@@ -1061,12 +1075,19 @@ function PlayerStrip({
   byId: Map<string, CharacterDef>;
   disconnected?: boolean;
   label: string;
+  // When true, reserve a right-hand slot for the live activity line (used for
+  // the opponent strip). Kept always-present so it never shifts the layout.
+  showActivity?: boolean;
+  activity?: string | null;
   // Per-unit click/highlight props. Computed in BattleScreen so the same
   // targeting/activation state drives both field tokens and strip cards.
   getCardProps?: (unit: UnitState) => {
     activation?: TokenActivation;
     isValidTarget?: boolean;
     isClickable?: boolean;
+    preview?: HitPreview | null;
+    isLinked?: boolean;
+    onHoverChange?: (hovered: boolean) => void;
     onClick?: () => void;
   };
 }) {
@@ -1106,6 +1127,23 @@ function PlayerStrip({
           );
         })}
       </div>
+
+      {/* Live activity slot (opponent only). Fixed width + min height so the
+          banner appearing/disappearing never reflows the rest of the strip. */}
+      {showActivity && (
+        <div className="shrink-0 w-52 self-stretch flex items-center gap-2 px-3 rounded-md border border-sky-900/40 bg-sky-950/25">
+          {activity ? (
+            <>
+              <Eye className="h-4 w-4 shrink-0 text-sky-400 animate-pulse" />
+              <span className="text-xs font-medium text-sky-300 leading-snug line-clamp-2">
+                {activity}
+              </span>
+            </>
+          ) : (
+            <span className="text-xs text-zinc-600 italic">ожидает…</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1118,6 +1156,7 @@ function TargetingBar({
   targeting,
   validUnitTargets,
   validZoneTargets,
+  previews,
   battleUnits,
   byId,
   mySide,
@@ -1128,6 +1167,7 @@ function TargetingBar({
   targeting: NonNullable<Targeting>;
   validUnitTargets: ReadonlySet<string>;
   validZoneTargets: ReadonlySet<number>;
+  previews: Map<string, HitPreview>;
   battleUnits: Record<string, UnitState>;
   byId: Map<string, CharacterDef>;
   mySide: Side;
@@ -1172,6 +1212,7 @@ function TargetingBar({
       const u = battleUnits[uid];
       const char = u ? byId.get(u.char_id) : undefined;
       if (!u) continue;
+      const forecast = previews.get(uid);
       buttons.push(
         <button
           key={uid}
@@ -1180,8 +1221,14 @@ function TargetingBar({
           className="px-3 py-1.5 min-w-[120px] text-xs font-bold border border-amber-500/70 bg-amber-600/15 hover:bg-amber-600/30 text-amber-100"
         >
           {char?.name ?? uid}
-          <span className="block text-[10px] font-mono text-amber-300/70 mt-0.5">
+          <span className="flex items-center justify-center gap-1.5 text-[10px] font-mono text-amber-300/70 mt-0.5">
             HP {u.current_hp}/{u.max_hp}
+            {forecast &&
+              (forecast.lethal ? (
+                <Skull className="h-3 w-3 text-red-400" />
+              ) : (
+                <span className="italic font-black text-red-300">−{forecast.amount}</span>
+              ))}
           </span>
         </button>,
       );
@@ -1302,6 +1349,8 @@ type FanItem =
       kind: "attack";
       char: CharacterDef;
       onAttack?: () => void;  // undefined when inspecting → no button rendered
+      // The unit isn't active yet: the button activates it first.
+      planning?: boolean;
     }
   | {
       kind: "ability";
@@ -1312,6 +1361,7 @@ type FanItem =
       // ability is on CD / not enough energy / token spent we just don't
       // render a button — the inspector sees the description and stats.
       onUse?: () => void;
+      planning?: boolean;
     }
   | {
       kind: "passive";
@@ -1336,6 +1386,7 @@ function UnitDetailPanel({
   onChooseMove,
   onEndTurn,
   onClose,
+  onHoverAbility,
 }: {
   unit: UnitState;
   char: CharacterDef;
@@ -1351,22 +1402,17 @@ function UnitDetailPanel({
   onChooseMove: () => void;
   onEndTurn: () => void;
   onClose: () => void;
+  // Telegraph that the player is hovering (considering) an ability. Pass null
+  // on mouse-leave. Only meaningful for the player's own active unit.
+  onHoverAbility?: (ability: AbilityDef | null) => void;
 }) {
-  // Can attack only if neither attacked nor used a (non-quick) ability yet.
-  const canAttack =
-    isActiveOwner && !isStunned && !unit.has_attacked && !unit.has_used_ability;
-  const canMove = isActiveOwner && !isStunned && unit.move_count < 1;
-
-  // Per-ability usability: enough energy, off cooldown, token free for slow.
-  const canUse = (ability: AbilityDef): boolean => {
-    if (!isActiveOwner || isStunned) return false;
-    if (unit.current_energy < ability.energy_cost) return false;
-    if ((unit.cooldowns[ability.id] ?? 0) > 0) return false;
-    // Non-quick abilities are locked out only by having attacked (not by other
-    // abilities) — so you can chain as many as energy/cooldowns allow.
-    if (!ability.is_quick && unit.has_attacked) return false;
-    return true;
-  };
+  // Before activation, attack/ability buttons mean "activate and …" and are
+  // judged on the state the unit will have once activated.
+  const planning = canActivate && !willSkipWhenActivated(unit);
+  const acting = isActiveOwner ? unit : planning ? projectActivation(unit, char) : null;
+  const canAttack = !!acting && canAttackNow(acting, isStunned);
+  const canMove = isActiveOwner && canMoveNow(unit, isStunned);
+  const canUse = (ability: AbilityDef): boolean => !!acting && canUseNow(acting, ability, isStunned);
 
   const abilityTag = (a: AbilityDef): string =>
     a.is_ult ? "Ульта" : a.is_quick ? "Быстрая" : "Способность";
@@ -1420,12 +1466,16 @@ function UnitDetailPanel({
 
         <article className="border border-amber-600/40 bg-zinc-900/70 overflow-hidden flex flex-col">
           <CardTitle name={char.attack.name} tag="Атака" />
-          <AttackCardBody item={{ kind: "attack", char, onAttack: canAttack ? onChooseAttack : undefined }} />
+          <AttackCardBody
+            item={{ kind: "attack", char, onAttack: canAttack ? onChooseAttack : undefined, planning: !isActiveOwner }}
+          />
         </article>
 
         {char.abilities.map((ability) => (
           <article
             key={ability.id}
+            onMouseEnter={() => onHoverAbility?.(ability)}
+            onMouseLeave={() => onHoverAbility?.(null)}
             className={cn(
               "border bg-zinc-900/70 overflow-hidden flex flex-col",
               ability.is_ult ? "border-fuchsia-600/50" : "border-amber-600/40",
@@ -1439,6 +1489,7 @@ function UnitDetailPanel({
                 unit,
                 ability,
                 onUse: canUse(ability) ? () => onUseAbility(ability) : undefined,
+                planning: !isActiveOwner,
               }}
             />
           </article>
@@ -1561,7 +1612,7 @@ function HeroCardBody({ item }: { item: Extract<FanItem, { kind: "hero" }> }) {
         {/* Active statuses — coloured duration rings, spaced so they never
             blur into one strip. Green = buff, red = debuff. */}
         {unit.statuses.length > 0 && (
-          <StatusRow statuses={unit.statuses} />
+          <StatusChips statuses={unit.statuses} />
         )}
 
         {/* Turn actions, on the card. Activate (before activation) ▸ Move ▸
@@ -1674,7 +1725,7 @@ function AttackCardBody({ item }: { item: Extract<FanItem, { kind: "attack" }> }
             onClick={item.onAttack}
             className="w-full h-9 text-xs font-bold border border-amber-500/80 bg-amber-600/20 hover:bg-amber-600/35 text-amber-100"
           >
-            Атаковать
+            {item.planning ? "Активировать и атаковать" : "Атаковать"}
           </button>
         </div>
       )}
@@ -1776,7 +1827,7 @@ function AbilityCardBody({ item }: { item: Extract<FanItem, { kind: "ability" }>
             onClick={item.onUse}
             className="w-full h-9 text-xs font-bold border border-amber-500/80 bg-amber-600/20 hover:bg-amber-600/35 text-amber-100"
           >
-            Использовать
+            {item.planning ? "Активировать и использовать" : "Использовать"}
           </button>
         </div>
       )}
@@ -1831,16 +1882,25 @@ function BattleMapView({ children }: { children: React.ReactNode }) {
   stateRef.current = { scale, pan };
   const dragRef = useRef({ pointerX: 0, pointerY: 0, panX: 0, panY: 0 });
 
-  // Centre the field once the container has measured itself.
-  useEffect(() => {
+  // Scale the field to fit the viewport and centre it. Used on mount and by
+  // the reset button so the whole (wide, short) board is visible without the
+  // player having to manually zoom out.
+  const fitToContainer = useCallback(() => {
     const container = containerRef.current;
     const inner = innerRef.current;
     if (!container || !inner) return;
-    setPan({
-      x: (container.clientWidth - inner.offsetWidth) / 2,
-      y: (container.clientHeight - inner.offsetHeight) / 2,
-    });
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    const iw = inner.offsetWidth || 1;
+    const ih = inner.offsetHeight || 1;
+    const fit = Math.max(0.4, Math.min(2.5, Math.min(cw / iw, ch / ih) * 0.96));
+    setScale(fit);
+    setPan({ x: (cw - iw * fit) / 2, y: (ch - ih * fit) / 2 });
   }, []);
+
+  useEffect(() => {
+    fitToContainer();
+  }, [fitToContainer]);
 
   // Native wheel listener — React's synthetic wheel is passive in some setups
   // so preventDefault gets ignored. We attach manually with passive: false.
@@ -1928,16 +1988,7 @@ function BattleMapView({ children }: { children: React.ReactNode }) {
     setScale(newScale);
   };
 
-  const reset = () => {
-    const container = containerRef.current;
-    const inner = innerRef.current;
-    if (!container || !inner) return;
-    setScale(1);
-    setPan({
-      x: (container.clientWidth - inner.offsetWidth) / 2,
-      y: (container.clientHeight - inner.offsetHeight) / 2,
-    });
-  };
+  const reset = fitToContainer;
 
   return (
     <div
@@ -2271,29 +2322,37 @@ export default function BattleScreen({
   rightPlayer,
   battle,
   mySide,
+  turnClock,
+  battleLog,
+  eventBatch,
   opponentDisconnected,
   procPulses,
-  opponentInspect,
+  opponentIntent,
   telegraphs,
-  onInspect,
+  onIntent,
   actions,
 }: BattleScreenProps) {
   const { byId, isLoading, error } = useCharacterRoster();
   const oppSide: Side = mySide === "LEFT" ? "RIGHT" : "LEFT";
   const isMyTurn = battle.current_actor_side === mySide;
 
+  // Smooth token movement between zones (walk, pull, swap, respawn…).
+  const boardRef = useRef<HTMLDivElement>(null);
+  const fxLayerRef = useRef<HTMLDivElement>(null);
+  const registerToken = useTokenMotion(boardRef, fxLayerRef, battle, eventBatch ?? null);
+
   const [targeting, setTargeting] = useState<Targeting>(null);
   // "Inspect" selection — independent from `battle.active_unit_id`. Clicking
   // any unit (mine or enemy) sets this; activation happens via a separate
   // button so a player can peek at enemy / non-activated own units freely.
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
-
-  // Telegraph our inspection to the opponent so they see what we're reading.
-  const onInspectRef = useRef(onInspect);
-  onInspectRef.current = onInspect;
-  useEffect(() => {
-    onInspectRef.current?.(selectedUnitId);
-  }, [selectedUnitId]);
+  // The ability the player is currently hovering in the kit panel (considering
+  // but not yet committed). Drives the "hover" intent telegraph.
+  const [hoveredAbilityName, setHoveredAbilityName] = useState<string | null>(null);
+  // Unit under the cursor (token or hero card) — highlights its counterpart.
+  const [hoveredUnitId, setHoveredUnitId] = useState<string | null>(null);
+  const linkHover = (uid: string) => (on: boolean) =>
+    setHoveredUnitId((curr) => (on ? uid : curr === uid ? null : curr));
 
   // Drag-to-move state. Tracks the in-flight pointer for the currently
   // activated unit. `isDragging` flips on once the pointer crosses the 6px
@@ -2309,11 +2368,24 @@ export default function BattleScreen({
   } | null>(null);
   const DRAG_THRESHOLD = 6;
 
-  // Clear targeting / drag if the active unit changes (turn ends).
+  // A choice made in the detail panel before the unit was activated ("attack
+  // with him", "cast X with him"). The click activates the unit; the plan is
+  // applied as soon as the server confirms the activation.
+  const planRef = useRef<{ unitId: string; targeting: Targeting } | null>(null);
+
+  // Reset targeting / drag / ability-hover when the active unit changes (turn
+  // ends), or open the planned targeting if this is the planned activation.
   useEffect(() => {
-    setTargeting(null);
+    const plan = planRef.current;
+    const ready = !!plan && plan.unitId === battle.active_unit_id;
+    // Consumed, or stale (another unit activated / the turn moved on).
+    if (plan && (ready || battle.active_unit_id || battle.current_actor_side !== mySide)) {
+      planRef.current = null;
+    }
+    setTargeting(ready ? plan.targeting : null);
     setDragState(null);
-  }, [battle.active_unit_id, battle.current_actor_side]);
+    setHoveredAbilityName(null);
+  }, [battle.active_unit_id, battle.current_actor_side, mySide]);
 
   // Whenever the server activates a unit (mine or theirs), pull selection to
   // it so the fan area shows the right cards by default. The player can still
@@ -2339,6 +2411,38 @@ export default function BattleScreen({
   // Aura bonus to ability reach (Starlink). Added to ability selector ranges so
   // the UI offers the same targets the server will accept.
   const abilityRangeBonus = activeUnit?.modifiers?.ABILITY_RANGE ?? 0;
+
+  // ── Outbound intent telegraph ──────────────────────────────────────────
+  // Derive what *we* are doing and relay it so the opponent can anticipate the
+  // next move. Priority: considering an ability (hover) > choosing a target >
+  // inspecting a hero. Sent only when the derived intent actually changes.
+  const localIntent = useMemo<OpponentIntent | null>(() => {
+    // Committed to choosing a target — this wins over a lingering hover.
+    if (targeting) {
+      if (targeting.kind === "MOVE") return { kind: "move" };
+      if (targeting.kind === "ATTACK") {
+        return { kind: "targeting", abilityName: activeChar?.attack.name ?? "Атака" };
+      }
+      const ab = activeChar?.abilities.find((a) => a.id === targeting.abilityId);
+      return { kind: "targeting", abilityName: ab?.name ?? null };
+    }
+    // Considering an ability but not committed yet.
+    if (hoveredAbilityName && isMyTurn && isMyActiveUnit) {
+      return { kind: "hover", abilityName: hoveredAbilityName };
+    }
+    if (selectedUnitId) return { kind: "inspect", unitId: selectedUnitId };
+    return null;
+  }, [targeting, hoveredAbilityName, isMyTurn, isMyActiveUnit, activeChar, selectedUnitId]);
+
+  const lastIntentKey = useRef<string>("");
+  useEffect(() => {
+    const key = localIntent
+      ? `${localIntent.kind}|${localIntent.unitId ?? ""}|${localIntent.abilityName ?? ""}`
+      : "";
+    if (key === lastIntentKey.current) return;
+    lastIntentKey.current = key;
+    onIntent?.(localIntent);
+  }, [localIntent, onIntent]);
 
   // Zones the active unit could currently move into (independent of how the
   // move is invoked — click-after-button or drag).
@@ -2460,6 +2564,64 @@ export default function BattleScreen({
         (targeting?.kind === "ABILITY_UNIT_THEN_ZONE" && !targeting.pendingUnitId)
       ? validAbilityUnitTargets
       : EMPTY_STRING_SET;
+
+  // Predicted damage on each highlighted enemy for the pending attack/ability.
+  // Effects that landed with this snapshot, keyed by unit — each floats up
+  // over its token once. Multi-status abilities (Hell Week) show by group.
+  const statusPulses = useMemo(() => {
+    const map: Record<string, StatusPulse> = {};
+    if (!eventBatch) return map;
+    eventBatch.events.forEach((ev, i) => {
+      if (ev.t !== "status") return;
+      const info = describeStatus({ name: ev.group ?? ev.name, value: ev.value ?? undefined });
+      map[ev.dst] = { name: info.short, tone: info.tone, Icon: info.Icon, key: eventBatch.key * 1000 + i };
+    });
+    return map;
+  }, [eventBatch]);
+
+  const hitPreviews = useMemo(() => {
+    const map = new Map<string, HitPreview>();
+    if (!activeUnit || !activeChar || !targeting) return map;
+    const ability =
+      targeting.kind === "ABILITY_UNIT"
+        ? activeChar.abilities.find((a) => a.id === targeting.abilityId)
+        : undefined;
+    if (targeting.kind !== "ATTACK" && !ability) return map;
+    for (const uid of visibleUnitTargets) {
+      const target = battle.units[uid];
+      if (!target) continue;
+      const p = ability
+        ? previewAbility(activeUnit, activeChar, ability, target)
+        : previewAttack(activeUnit, activeChar, target);
+      if (p) map.set(uid, p);
+    }
+    return map;
+  }, [activeUnit, activeChar, targeting, visibleUnitTargets, battle.units]);
+
+  // Begin casting: fire right away if the ability needs no target, otherwise
+  // enter the matching targeting mode.
+  const startAbility = (ability: AbilityDef) => {
+    const mode = abilityTargeting(ability, abilityRangeBonus);
+    if (mode) setTargeting(mode);
+    else actions.useAbility({ abilityId: ability.id });
+  };
+
+  // Attack / ability chosen for `unit`: straight away if it's the active
+  // unit, otherwise activate it first and carry the choice over. The server
+  // handles one socket's messages in order, so a no-target ability can be
+  // sent right behind the activation.
+  const actWith = (unit: UnitState, choice: { attack: true } | { ability: AbilityDef }) => {
+    if (battle.active_unit_id === unit.unit_id) {
+      if ("attack" in choice) setTargeting({ kind: "ATTACK" });
+      else startAbility(choice.ability);
+      return;
+    }
+    const mode: Targeting =
+      "attack" in choice ? { kind: "ATTACK" } : abilityTargeting(choice.ability, unit.modifiers?.ABILITY_RANGE ?? 0);
+    actions.activate(unit.unit_id);
+    if (mode) planRef.current = { unitId: unit.unit_id, targeting: mode };
+    else if ("ability" in choice) actions.useAbility({ abilityId: choice.ability.id });
+  };
 
   // Handler for clicks on any unit token (field or strip).
   const handleTokenClick = (unit: UnitState) => {
@@ -2636,6 +2798,9 @@ export default function BattleScreen({
       activation,
       isValidTarget: visibleUnitTargets.has(unit.unit_id),
       isClickable: tokenIsClickable(unit),
+      preview: hitPreviews.get(unit.unit_id),
+      isLinked: hoveredUnitId === unit.unit_id,
+      onHoverChange: linkHover(unit.unit_id),
       onClick: () => handleTokenClick(unit),
     };
   };
@@ -2662,6 +2827,30 @@ export default function BattleScreen({
     [battle.units, oppSide],
   );
 
+  // Human-readable line describing what the opponent is doing right now, shown
+  // prominently in the header. Falls back to "thinking" on their turn so the
+  // banner is informative even without an explicit intent.
+  const oppActivity = useMemo<string | null>(() => {
+    const it = opponentIntent;
+    if (it) {
+      if (it.kind === "inspect") {
+        const char = byId.get(battle.units[it.unitId ?? ""]?.char_id ?? "");
+        return char ? `Смотрит способности — ${char.name}` : "Изучает героя";
+      }
+      if (it.kind === "hover") {
+        return it.abilityName
+          ? `Примеряется к способности — ${it.abilityName}`
+          : "Выбирает способность";
+      }
+      if (it.kind === "targeting") {
+        return it.abilityName ? `Выбирает цель — ${it.abilityName}` : "Выбирает цель";
+      }
+      if (it.kind === "move") return "Выбирает, куда переместиться";
+    }
+    if (!isMyTurn) return "Думает над ходом…";
+    return null;
+  }, [opponentIntent, isMyTurn, battle.units, byId]);
+
   const activeUnitIds = useMemo(() => {
     const set = new Set<string>();
     for (const u of Object.values(battle.units)) {
@@ -2672,12 +2861,78 @@ export default function BattleScreen({
     return set;
   }, [battle.units, battle.current_actor_side]);
 
+  // Keyboard shortcuts (physical key codes, so they work on any layout).
+  // Re-bound every render to always see the current turn state.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName))) return;
+      if (document.querySelector("[role='alertdialog']")) return;
+
+      if (e.code === "Escape") {
+        if (targeting) setTargeting(null);
+        else setSelectedUnitId(null);
+        return;
+      }
+      if (!isMyTurn) return;
+
+      if (!battle.active_unit_id) {
+        const ready = myUnits.filter((u) => activeUnitIds.has(u.unit_id));
+        if (e.code === "Tab" && ready.length) {
+          e.preventDefault();
+          const i = ready.findIndex((u) => u.unit_id === selectedUnitId);
+          setSelectedUnitId(ready[(i + 1) % ready.length].unit_id);
+        } else if (e.code === "Space") {
+          const pick =
+            ready.find((u) => u.unit_id === selectedUnitId) ?? (ready.length === 1 ? ready[0] : undefined);
+          if (pick) {
+            e.preventDefault();
+            actions.activate(pick.unit_id);
+          }
+        } else {
+          // A / 1–4 on the selected ready hero: activate it and go straight to the action.
+          const sel = ready.find((u) => u.unit_id === selectedUnitId);
+          const selChar = sel && byId.get(sel.char_id);
+          if (!sel || !selChar || willSkipWhenActivated(sel)) return;
+          const projected = projectActivation(sel, selChar);
+          if (e.code === "KeyA" && canAttackNow(projected, false)) {
+            actWith(sel, { attack: true });
+          } else if (/^Digit[1-9]$/.test(e.code)) {
+            const ability = selChar.abilities[Number(e.code.slice(5)) - 1];
+            if (ability && canUseNow(projected, ability, false)) actWith(sel, { ability });
+          }
+        }
+        return;
+      }
+
+      if (!isMyActiveUnit || !activeUnit || !activeChar) return;
+      if (e.code === "KeyA" && canAttackNow(activeUnit, isStunned)) {
+        setTargeting({ kind: "ATTACK" });
+      } else if (e.code === "KeyM" && canMoveNow(activeUnit, isStunned)) {
+        setTargeting({ kind: "MOVE" });
+      } else if (e.code === "KeyE") {
+        setSelectedUnitId(null);
+        actions.endTurn();
+      } else if (/^Digit[1-9]$/.test(e.code)) {
+        const ability = activeChar.abilities[Number(e.code.slice(5)) - 1];
+        if (ability && canUseNow(activeUnit, ability, isStunned)) startAbility(ability);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   return (
     <TooltipProvider delayDuration={150}>
     <div className="fixed inset-0 z-50 flex flex-col bg-background animate-in fade-in-0 duration-500">
       {/* Round + score + turn — kept ABOVE the opponent strip so the match
           state stays visible even when the opponent's cards expand. */}
-      <div className="flex items-center justify-center gap-6 px-6 py-2 border-b border-border bg-background/60">
+      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-4 px-6 py-2 border-b border-border bg-background/60">
+        <div className="justify-self-start">
+          <TurnTimer clock={turnClock ?? null} mine={isMyTurn} />
+        </div>
+        <div className="flex items-center justify-center gap-6">
         <div className="flex items-center gap-2">
           <span className="text-sm text-muted-foreground">Раунд</span>
           <span className="text-2xl font-black font-mono tabular-nums">
@@ -2715,15 +2970,46 @@ export default function BattleScreen({
         >
           {isMyTurn ? "Ваш ход" : "Ход соперника"}
         </div>
+        </div>
+
+        <div className="justify-self-end flex items-center gap-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label="Горячие клавиши"
+                className="h-8 w-8 flex items-center justify-center border border-zinc-700 bg-zinc-900/80 text-zinc-400 hover:text-zinc-100"
+              >
+                <Keyboard className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="bg-zinc-900 text-zinc-100 border border-zinc-700 text-[11px] p-3">
+              <p className="font-bold text-amber-300 mb-1.5">Горячие клавиши</p>
+              <ul className="space-y-0.5 text-zinc-300">
+                <li><b className="text-zinc-100">Tab</b> — следующий готовый герой</li>
+                <li><b className="text-zinc-100">Пробел</b> — активировать выбранного</li>
+                <li className="text-zinc-400">A и 1–4 работают и до активации — герой активируется сам</li>
+                <li><b className="text-zinc-100">A</b> — атака · <b className="text-zinc-100">M</b> — движение</li>
+                <li><b className="text-zinc-100">1–4</b> — способности</li>
+                <li><b className="text-zinc-100">E</b> — завершить ход</li>
+                <li><b className="text-zinc-100">Esc</b> — отмена / закрыть панель</li>
+              </ul>
+            </TooltipContent>
+          </Tooltip>
+          <SurrenderButton onConfirm={actions.surrender} />
+        </div>
       </div>
 
-      {/* Opponent strip */}
+      {/* Opponent strip — the intent line lives in its own right-hand section
+          here (reserved space, so it never shifts the layout). */}
       <PlayerStrip
         player={oppSide === "LEFT" ? leftPlayer : rightPlayer}
         units={oppUnits}
         byId={byId}
         disconnected={opponentDisconnected}
         label="Соперник"
+        showActivity
+        activity={oppActivity}
         getCardProps={unitCardProps}
       />
 
@@ -2759,46 +3045,17 @@ export default function BattleScreen({
               actions.endTurn();
             }}
             onClose={() => setSelectedUnitId(null)}
-            onChooseAttack={() => setTargeting({ kind: "ATTACK" })}
+            onChooseAttack={() => actWith(selectedUnit, { attack: true })}
             onChooseMove={() => setTargeting({ kind: "MOVE" })}
-            onUseAbility={(ability) => {
-              const kind = getAbilityTargetingKind(ability);
-              const abilityId = ability.id;
-              const flt = (k?: string) => k as "ALLIES" | "ENEMIES" | "ALL" | undefined;
-              if (kind.kind === "none") {
-                actions.useAbility({ abilityId });
-              } else if (kind.kind === "unit") {
-                setTargeting({
-                  kind: "ABILITY_UNIT",
-                  abilityId,
-                  filter: flt(kind.filter),
-                  range: kind.range === undefined ? undefined : kind.range + abilityRangeBonus,
-                });
-              } else if (kind.kind === "unit_then_zone") {
-                setTargeting({
-                  kind: "ABILITY_UNIT_THEN_ZONE",
-                  abilityId,
-                  filter: flt(kind.filter) ?? "ALLIES",
-                  castRange: kind.castRange + abilityRangeBonus,
-                  moveRange: kind.moveRange,
-                });
-              } else if (kind.kind === "two_units") {
-                setTargeting({
-                  kind: "ABILITY_TWO_UNITS",
-                  abilityId,
-                  filter: flt(kind.filter) ?? "ALLIES",
-                  range: kind.range + abilityRangeBonus,
-                });
-              } else {
-                setTargeting({ kind: "ABILITY_ZONE", abilityId, range: kind.range + abilityRangeBonus });
-              }
-            }}
+            onHoverAbility={(ab) => setHoveredAbilityName(ab?.name ?? null)}
+            onUseAbility={(ability) => actWith(selectedUnit, { ability })}
           />
         )}
         <BattleMapView>
           <div
+            ref={boardRef}
             className="relative grid grid-cols-5 divide-x divide-zinc-800/70 border border-zinc-800 bg-zinc-900/55"
-            style={{ width: 1100, height: 600 }}
+            style={{ width: 1500, height: 440 }}
           >
             {/* depth vignette + dot grid placeholder. Drop a landscape image
                 here later via background-image (or an absolute <img>). */}
@@ -2822,13 +3079,60 @@ export default function BattleScreen({
               const isCentre = displayIdx === 2;
               const isMyHalf = displayIdx < 2;
               const isValidMoveZone = visibleZoneTargets.has(zoneIndex);
+
+              const renderToken = (uid: string) => {
+                const unit = battle.units[uid];
+                if (!unit) return null;
+                const activation: TokenActivation =
+                  battle.active_unit_id === uid
+                    ? "current"
+                    : activeUnitIds.has(uid)
+                    ? "available"
+                    : "spent";
+                const beingDragged = dragState?.unitId === uid && dragState.isDragging;
+                const scatter = tokenScatter(uid);
+                return (
+                  // Outer wrapper: untransformed, so the motion hook can
+                  // measure its layout position and animate it between zones.
+                  <div key={uid} ref={registerToken(uid)} className="relative">
+                    <div
+                      style={{
+                        transform: `translate(${scatter.x}px, ${scatter.y}px) rotate(${scatter.rotate}deg)`,
+                      }}
+                    >
+                      <UnitToken
+                        unit={unit}
+                        char={byId.get(unit.char_id)}
+                        activation={activation}
+                        isMine={unit.owner_side === mySide}
+                        isSelected={selectedUnitId === uid}
+                        isValidTarget={visibleUnitTargets.has(uid)}
+                        isClickable={tokenIsClickable(unit)}
+                        isBeingDragged={beingDragged}
+                        procPulse={procPulses?.[uid]}
+                        statusPulse={statusPulses[uid]}
+                        isLinked={hoveredUnitId === uid}
+                        onHoverChange={linkHover(uid)}
+                        preview={hitPreviews.get(uid)}
+                        onClick={() => handleTokenClick(unit)}
+                        onPointerDown={(e) => handleTokenPointerDown(unit, e)}
+                        onPointerMove={handleTokenPointerMove}
+                        onPointerUp={handleTokenPointerUp}
+                      />
+                    </div>
+                  </div>
+                );
+              };
+
+              const [topRow, bottomRow] = splitZoneRows(unitIds);
               return (
                 <div
                   key={zoneIndex}
                   data-zone-index={zoneIndex}
                   onClick={() => handleZoneClick(zoneIndex)}
                   className={cn(
-                    "relative flex flex-col items-stretch h-full overflow-hidden",
+                    // Not overflow-hidden: tokens fly across zone borders.
+                    "relative flex flex-col items-stretch h-full",
                     isValidMoveZone &&
                       "ring-2 ring-amber-400 ring-inset cursor-pointer bg-amber-500/5",
                   )}
@@ -2844,55 +3148,42 @@ export default function BattleScreen({
                     )}
                   </div>
 
-                  <div className="flex-1 flex flex-col items-center justify-center gap-3 px-2 py-4">
+                  <div className="flex-1 flex flex-col items-center justify-center gap-y-3 px-1 py-2">
                     {unitIds.length === 0 ? (
                       <span className="text-xs text-zinc-700">пусто</span>
                     ) : (
-                      unitIds.map((uid) => {
-                        const unit = battle.units[uid];
-                        if (!unit) return null;
-                        const activation: TokenActivation =
-                          battle.active_unit_id === uid
-                            ? "current"
-                            : activeUnitIds.has(uid)
-                            ? "available"
-                            : "spent";
-                        const beingDragged =
-                          dragState?.unitId === uid && dragState.isDragging;
-                        const scatter = tokenScatter(uid);
-                        return (
+                      [topRow, bottomRow].map((row, ri) =>
+                        row.length === 0 ? null : (
                           <div
-                            key={uid}
-                            style={{
-                              transform: `translate(${scatter.x}px, ${scatter.y}px) rotate(${scatter.rotate}deg)`,
-                            }}
+                            key={ri}
+                            className="flex flex-row flex-wrap items-center justify-center gap-x-2 gap-y-1"
                           >
-                            <UnitToken
-                              unit={unit}
-                              char={byId.get(unit.char_id)}
-                              activation={activation}
-                              isMine={unit.owner_side === mySide}
-                              isSelected={selectedUnitId === uid}
-                              isValidTarget={visibleUnitTargets.has(uid)}
-                              isClickable={tokenIsClickable(unit)}
-                              isBeingDragged={beingDragged}
-                              procPulse={procPulses?.[uid]}
-                              inspectedByOpp={opponentInspect === uid}
-                              onClick={() => handleTokenClick(unit)}
-                              onPointerDown={(e) => handleTokenPointerDown(unit, e)}
-                              onPointerMove={handleTokenPointerMove}
-                              onPointerUp={handleTokenPointerUp}
-                            />
+                            {row.map((uid) => renderToken(uid))}
                           </div>
-                        );
-                      })
+                        ),
+                      )
                     )}
                   </div>
                 </div>
               );
             })}
+            {/* Movement streaks / bursts are drawn here imperatively by
+                useTokenMotion; React never renders children into it. */}
+            <div ref={fxLayerRef} className="absolute inset-0 pointer-events-none z-10" />
           </div>
         </BattleMapView>
+
+        <BattleLog
+          log={battleLog ?? []}
+          battle={battle}
+          byId={byId}
+          mySide={mySide}
+          className={cn(
+            "absolute bottom-3 z-30 transition-[left] duration-200",
+            // Step aside when the detail panel is docked on the left.
+            selectedUnit && selectedUnit.owner_side === mySide ? "left-[392px]" : "left-3",
+          )}
+        />
       </div>
 
       {/* My strip */}
@@ -2912,6 +3203,7 @@ export default function BattleScreen({
           targeting={targeting}
           validUnitTargets={visibleUnitTargets}
           validZoneTargets={visibleZoneTargets}
+          previews={hitPreviews}
           battleUnits={battle.units}
           byId={byId}
           mySide={mySide}

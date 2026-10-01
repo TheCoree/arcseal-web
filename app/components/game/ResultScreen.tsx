@@ -1,185 +1,368 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { Crown, House, RotateCcw, Skull, Sparkles, Swords, Shield } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { RankBadge, getProgressDetails } from "@/app/components/RankBadge";
-import { absolutizeAvatarUrl } from "@/lib/utils";
-import type { PlayerInfo, ResultData } from "@/app/components/game/types";
+import { useCharacterRoster } from "@/app/hooks/useCharacterRoster";
+import { absolutizeAvatarUrl, absolutizeMediaUrl, cn } from "@/lib/utils";
+import type {
+  CharacterDef,
+  EndReason,
+  FinishInfo,
+  MatchSummary,
+  PlayerInfo,
+  ResultData,
+  Side,
+} from "@/app/components/game/types";
 
 interface ResultScreenProps {
   me: PlayerInfo | null;
   opponent: PlayerInfo | null;
+  mySide: Side | null;
   myResult: ResultData | null;
   opponentResult: ResultData | null;
+  finish: FinishInfo | null;
   onReturnHome: () => void;
+  onPlayAgain: () => void;
 }
 
-function PlayerScoreCard({
-  player,
-  score,
-  highlight,
-}: {
-  player: PlayerInfo | null;
-  score: number;
-  highlight: "win" | "lose" | "draw" | "neutral";
-}) {
-  const ring =
-    highlight === "win"
-      ? "ring-2 ring-green-500/70"
-      : highlight === "lose"
-      ? "ring-2 ring-destructive/60"
-      : highlight === "draw"
-      ? "ring-2 ring-yellow-500/60"
-      : "ring-1 ring-border";
+type Outcome = "win" | "lose" | "draw";
 
+const OUTCOME_STYLE: Record<Outcome, { title: string; text: string; glow: string; rgb: string }> = {
+  win: { title: "ПОБЕДА", text: "text-amber-300", glow: "rgba(251,191,36,0.28)", rgb: "251,191,36" },
+  lose: { title: "ПОРАЖЕНИЕ", text: "text-red-400", glow: "rgba(239,68,68,0.22)", rgb: "239,68,68" },
+  draw: { title: "НИЧЬЯ", text: "text-zinc-200", glow: "rgba(161,161,170,0.2)", rgb: "161,161,170" },
+};
+
+function reasonText(reason: EndReason | undefined, outcome: Outcome): string {
+  const won = outcome === "win";
+  switch (reason) {
+    case "surrender":
+      return won ? "Соперник сдался" : "Вы сдались";
+    case "disconnect":
+      return won ? "Соперник покинул матч и не вернулся" : "Вы отключились и не вернулись вовремя";
+    case "afk":
+      return won ? "Техническая победа: соперник бездействовал" : "Техническое поражение за бездействие";
+    default:
+      return outcome === "draw"
+        ? "Силы оказались равны"
+        : won
+        ? "Вы первыми набрали нужное число убийств"
+        : "Соперник первым набрал нужное число убийств";
+  }
+}
+
+function roundsLabel(n: number): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  const word =
+    mod10 === 1 && mod100 !== 11 ? "раунд" : mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? "раунда" : "раундов";
+  return `${n} ${word}`;
+}
+
+// Animate a number from `from` to `to` after a short delay (ELO counter).
+function useCountUp(from: number, to: number, durationMs = 1300, delayMs = 700): number {
+  const [value, setValue] = useState(from);
+  useEffect(() => {
+    let raf = 0;
+    const start = performance.now() + delayMs;
+    const tick = (now: number) => {
+      const p = Math.max(0, Math.min(1, (now - start) / durationMs));
+      const eased = 1 - Math.pow(1 - p, 3);
+      setValue(Math.round(from + (to - from) * eased));
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [from, to, durationMs, delayMs]);
+  return value;
+}
+
+// Most valuable unit: kills weigh most, then damage dealt and healing done.
+function mvpOf(summary: MatchSummary | undefined): string | null {
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const u of summary?.units ?? []) {
+    const score = u.stats.kills * 40 + u.stats.damage_dealt + u.stats.healing;
+    if (score > bestScore) {
+      bestScore = score;
+      best = u.unit_id;
+    }
+  }
+  return best;
+}
+
+// Deterministic sparks rising behind the title on a win.
+function Sparks({ rgb }: { rgb: string }) {
   return (
-    <div className="flex-1 flex flex-col items-center gap-3">
-      <div className={`relative rounded-full ${ring} p-1 transition-all duration-500`}>
-        <Avatar className="h-20 w-20 border-2 border-background">
+    <div className="pointer-events-none absolute inset-0 overflow-hidden">
+      {Array.from({ length: 26 }, (_, i) => {
+        const left = (i * 37) % 100;
+        const size = 2 + ((i * 7) % 4);
+        const delay = ((i * 13) % 40) / 10;
+        const duration = 5 + ((i * 11) % 40) / 10;
+        return (
+          <span
+            key={i}
+            className="absolute bottom-0 rounded-full"
+            style={{
+              left: `${left}%`,
+              width: size,
+              height: size,
+              background: `rgba(${rgb},0.9)`,
+              boxShadow: `0 0 8px rgba(${rgb},0.9)`,
+              animation: `result-spark ${duration}s linear ${delay}s infinite`,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function PlayerBadge({ player, label, highlight }: { player: PlayerInfo | null; label: string; highlight: boolean }) {
+  return (
+    <div className="flex flex-col items-center gap-2 min-w-0">
+      <div className={cn("rounded-full p-1", highlight ? "ring-2 ring-amber-400/80" : "ring-1 ring-border")}>
+        <Avatar className="h-16 w-16 sm:h-20 sm:w-20 border-2 border-background">
           <AvatarImage src={absolutizeAvatarUrl(player?.avatar_url) || ""} />
-          <AvatarFallback className="text-2xl font-bold bg-muted">
+          <AvatarFallback className="text-xl font-bold bg-muted">
             {player?.display_name?.slice(0, 2).toUpperCase() ?? "?"}
           </AvatarFallback>
         </Avatar>
       </div>
-      <div className="text-center space-y-1">
-        <p className="text-sm font-bold text-foreground leading-none">{player?.display_name ?? "???"}</p>
-        {player && <RankBadge elo={player.elo} size="sm" />}
+      <span className="text-[10px] uppercase tracking-widest text-muted-foreground">{label}</span>
+      <span className="text-sm font-bold truncate max-w-[10rem]">{player?.display_name ?? "—"}</span>
+      {player && <RankBadge elo={player.elo} size="sm" />}
+    </div>
+  );
+}
+
+function HeroRow({
+  unit,
+  char,
+  maxDamage,
+  isMvp,
+}: {
+  unit: MatchSummary["units"][number];
+  char: CharacterDef | undefined;
+  maxDamage: number;
+  isMvp: boolean;
+}) {
+  const portrait = absolutizeMediaUrl(char?.portrait_url ?? null);
+  const s = unit.stats;
+  return (
+    <div className={cn("flex items-center gap-3 px-3 py-2 border", isMvp ? "border-amber-500/60 bg-amber-500/5" : "border-zinc-800 bg-zinc-900/50")}>
+      <div className="relative h-10 w-10 shrink-0 rounded-full overflow-hidden bg-zinc-800 border border-zinc-700 flex items-center justify-center">
+        {portrait ? (
+          <img src={portrait} alt="" className="absolute inset-0 h-full w-full object-cover" draggable={false} />
+        ) : (
+          <span className="font-black text-zinc-300">{char?.name?.slice(0, 1) ?? "?"}</span>
+        )}
       </div>
-      <div className="bg-muted/40 border border-border rounded-2xl px-6 py-2 text-center">
-        <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-widest block">Счёт</span>
-        <span className="text-3xl font-black font-mono tabular-nums text-foreground">{score}</span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm font-bold truncate">{char?.name ?? unit.char_id}</span>
+          {isMvp && (
+            <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-amber-300">
+              <Crown className="h-3 w-3" /> MVP
+            </span>
+          )}
+        </div>
+        <div className="mt-1 h-1.5 w-full bg-zinc-800 overflow-hidden">
+          <div
+            className="h-full bg-gradient-to-r from-orange-500 to-red-500 transition-[width] duration-1000 ease-out"
+            style={{ width: `${maxDamage > 0 ? (s.damage_dealt / maxDamage) * 100 : 0}%` }}
+          />
+        </div>
+      </div>
+      <div className="grid grid-cols-4 gap-3 text-right text-xs tabular-nums shrink-0">
+        <span title="Убийства / смерти" className="font-bold">
+          {s.kills}<span className="text-zinc-500">/{s.deaths}</span>
+        </span>
+        <span title="Нанесено урона" className="text-orange-300 inline-flex items-center justify-end gap-0.5">
+          <Swords className="h-3 w-3" />{s.damage_dealt}
+        </span>
+        <span title="Получено урона" className="text-zinc-400 inline-flex items-center justify-end gap-0.5">
+          <Shield className="h-3 w-3" />{s.damage_taken}
+        </span>
+        <span title="Лечение" className="text-green-400 inline-flex items-center justify-end gap-0.5">
+          <Sparkles className="h-3 w-3" />{s.healing}
+        </span>
       </div>
     </div>
   );
 }
 
-export default function ResultScreen({ me, opponent, myResult, opponentResult, onReturnHome }: ResultScreenProps) {
+export default function ResultScreen({
+  me,
+  opponent,
+  mySide,
+  myResult,
+  opponentResult,
+  finish,
+  onReturnHome,
+  onPlayAgain,
+}: ResultScreenProps) {
+  const { byId } = useCharacterRoster();
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => setMounted(true), 50);
     return () => clearTimeout(t);
   }, []);
 
+  const oldElo = myResult ? myResult.new_elo - myResult.elo_change : 0;
+  const shownElo = useCountUp(oldElo, myResult?.new_elo ?? 0);
+  const mvp = useMemo(() => mvpOf(finish?.summary), [finish]);
+
   if (!myResult || !opponentResult) return null;
 
-  const isDraw = myResult.is_draw ?? myResult.score === opponentResult.score;
-  const isWin = !isDraw && myResult.is_winner;
+  const outcome: Outcome = myResult.is_draw ? "draw" : myResult.is_winner ? "win" : "lose";
+  const look = OUTCOME_STYLE[outcome];
 
-  const title = isDraw ? "НИЧЬЯ" : isWin ? "ПОБЕДА" : "ПОРАЖЕНИЕ";
-  const titleColor = isDraw ? "text-yellow-500" : isWin ? "text-green-500" : "text-destructive";
+  const units = finish?.summary.units ?? [];
+  const mine = units.filter((u) => u.owner_side === mySide);
+  const theirs = units.filter((u) => u.owner_side !== mySide);
+  const maxDamage = Math.max(1, ...units.map((u) => u.stats.damage_dealt));
 
-  const eloSign = myResult.elo_change >= 0 ? "+" : "";
-  const eloColor =
-    myResult.elo_change > 0
-      ? "text-green-500"
-      : myResult.elo_change < 0
-      ? "text-destructive"
-      : "text-muted-foreground";
+  const delta = myResult.elo_change;
+  const pInfo = getProgressDetails(shownElo);
+  const percent = Math.max(0, Math.min(100, ((shownElo - pInfo.prevElo) / pInfo.range) * 100));
 
-  const pInfo = getProgressDetails(myResult.new_elo);
-  const oldElo = myResult.new_elo - myResult.elo_change;
-  const oldPercent = Math.max(0, Math.min(100, ((oldElo - pInfo.prevElo) / pInfo.range) * 100));
-  const newPercent = Math.max(0, Math.min(100, ((myResult.new_elo - pInfo.prevElo) / pInfo.range) * 100));
-  const baseWidth = Math.min(oldPercent, newPercent);
-  const deltaWidth = Math.abs(newPercent - oldPercent);
+  const fadeUp = (delay: number): React.CSSProperties => ({
+    opacity: mounted ? 1 : 0,
+    transform: mounted ? "translateY(0)" : "translateY(16px)",
+    transition: `opacity 0.6s ease ${delay}s, transform 0.6s ease ${delay}s`,
+  });
 
   return (
-    <div className="fixed inset-0 z-[100] flex flex-col bg-background/95 backdrop-blur-md animate-in fade-in-0 duration-500">
+    <div className="fixed inset-0 z-[100] overflow-y-auto bg-zinc-950 animate-in fade-in-0 duration-500">
+      {/* Outcome-tinted backdrop */}
       <div
-        className="w-full px-8 py-5 border-b border-border bg-card/60 text-center"
-        style={{
-          opacity: mounted ? 1 : 0,
-          transform: mounted ? "translateY(0)" : "translateY(-12px)",
-          transition: "opacity 0.5s ease, transform 0.5s ease",
-        }}
-      >
-        <p className="text-[10px] font-bold text-muted-foreground tracking-[0.25em] uppercase">Матч окончен</p>
-        <h1 className={`text-4xl sm:text-5xl font-black tracking-widest uppercase mt-1 ${titleColor}`}>{title}</h1>
-      </div>
+        className="pointer-events-none fixed inset-0"
+        style={{ background: `radial-gradient(ellipse at 50% 18%, ${look.glow} 0%, transparent 60%)` }}
+      />
+      {outcome === "win" && <Sparks rgb={look.rgb} />}
 
-      <div className="flex-1 flex items-center justify-center w-full max-w-3xl mx-auto px-8 py-10">
-        <div
-          className="w-full flex flex-col gap-10"
-          style={{
-            opacity: mounted ? 1 : 0,
-            transform: mounted ? "translateY(0)" : "translateY(20px)",
-            transition: "opacity 0.6s ease 0.1s, transform 0.6s ease 0.1s",
-          }}
-        >
-          <div className="flex items-stretch gap-6">
-            <PlayerScoreCard
-              player={me}
-              score={myResult.score}
-              highlight={isDraw ? "draw" : isWin ? "win" : "lose"}
-            />
-            <div className="flex flex-col items-center justify-center gap-2 shrink-0">
-              <span className="text-[10px] font-black text-muted-foreground tracking-[0.25em]">VS</span>
-              <div className="h-24 w-px bg-border" />
+      <div className="relative mx-auto flex min-h-full w-full max-w-4xl flex-col gap-8 px-6 py-10">
+        {/* Title */}
+        <header className="text-center">
+          <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-muted-foreground">
+            Матч окончен{finish?.summary.rounds ? ` · ${roundsLabel(finish.summary.rounds)}` : ""}
+          </p>
+          <h1
+            className={cn("mt-2 text-5xl sm:text-7xl font-black", look.text)}
+            style={{
+              animation: "result-title-in 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) both",
+              textShadow: `0 0 40px rgba(${look.rgb},0.45)`,
+            }}
+          >
+            {look.title}
+          </h1>
+          <p className="mt-3 text-sm text-zinc-300" style={fadeUp(0.5)}>
+            {reasonText(finish?.reason, outcome)}
+          </p>
+        </header>
+
+        {/* Players + kill score */}
+        <section className="flex items-center justify-center gap-6 sm:gap-12" style={fadeUp(0.2)}>
+          <PlayerBadge player={me} label="Вы" highlight={outcome === "win"} />
+          <div className="flex flex-col items-center">
+            <div className="flex items-baseline gap-3 font-mono font-black tabular-nums">
+              <span className="text-5xl sm:text-6xl text-emerald-300">{myResult.score}</span>
+              <span className="text-3xl text-zinc-600">:</span>
+              <span className="text-5xl sm:text-6xl text-rose-300">{opponentResult.score}</span>
             </div>
-            <PlayerScoreCard
-              player={opponent}
-              score={opponentResult.score}
-              highlight={isDraw ? "draw" : isWin ? "lose" : "win"}
-            />
+            <span className="mt-1 inline-flex items-center gap-1 text-[10px] uppercase tracking-widest text-muted-foreground">
+              <Skull className="h-3 w-3" /> убийства
+            </span>
           </div>
+          <PlayerBadge player={opponent} label="Соперник" highlight={outcome === "lose"} />
+        </section>
 
-          <div className="bg-muted/20 border border-border rounded-2xl p-6 sm:p-8">
-            <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
-              <h3 className="text-sm font-bold text-muted-foreground uppercase tracking-widest">Рейтинг ELO</h3>
-              <div className="flex items-baseline gap-3">
-                <span className="text-xl font-mono text-muted-foreground line-through opacity-60">{oldElo}</span>
-                <span className={`text-2xl sm:text-3xl font-black font-mono ${eloColor}`}>
-                  {eloSign}
-                  {myResult.elo_change}
-                </span>
-                <span className="text-3xl sm:text-4xl font-mono text-foreground ml-1">{myResult.new_elo}</span>
-              </div>
+        {/* ELO */}
+        <section className="border border-zinc-800 bg-zinc-900/60 p-5 sm:p-6" style={fadeUp(0.35)}>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <h3 className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Рейтинг</h3>
+            <div className="flex items-baseline gap-3">
+              <span
+                className={cn(
+                  "px-2 py-0.5 text-sm font-black font-mono border",
+                  delta > 0
+                    ? "text-green-300 border-green-600/50 bg-green-950/40"
+                    : delta < 0
+                    ? "text-red-300 border-red-600/50 bg-red-950/40"
+                    : "text-zinc-300 border-zinc-700",
+                )}
+              >
+                {delta > 0 ? "+" : ""}
+                {delta}
+              </span>
+              <span className="text-4xl font-black font-mono tabular-nums">{shownElo}</span>
             </div>
+          </div>
+          <div className="mt-4 flex items-center gap-3">
+            <RankBadge elo={shownElo} size="sm" />
+            <div className="relative h-3 flex-1 overflow-hidden border border-zinc-700 bg-zinc-800">
+              <div
+                className="h-full"
+                style={{
+                  width: `${percent}%`,
+                  background: pInfo.isMax
+                    ? pInfo.currentRankInfo.fromColor
+                    : `linear-gradient(90deg, ${pInfo.currentRankInfo.fromColor} 0%, ${pInfo.nextRankInfo.toColor} 100%)`,
+                }}
+              />
+            </div>
+            {!pInfo.isMax && <RankBadge elo={pInfo.nextElo} size="sm" />}
+          </div>
+          {!pInfo.isMax && (
+            <p className="mt-2 text-right text-[11px] text-muted-foreground">
+              До ранга «{pInfo.nextRankInfo.title}»: {Math.max(0, pInfo.nextElo - shownElo)} ELO
+            </p>
+          )}
+        </section>
 
-            <div className="flex flex-col gap-3">
-              <div className="flex items-center justify-between gap-4">
-                <RankBadge elo={myResult.new_elo} size="sm" />
-
-                <div className="flex-1 h-4 bg-muted/40 rounded-full overflow-hidden border border-border/50 relative shadow-inner flex">
-                  <div
-                    className="h-full transition-all duration-1000 ease-out"
-                    style={{
-                      width: `${baseWidth}%`,
-                      background: pInfo.isMax
-                        ? pInfo.currentRankInfo.fromColor
-                        : `linear-gradient(90deg, ${pInfo.currentRankInfo.fromColor} 0%, ${pInfo.nextRankInfo.toColor} 100%)`,
-                    }}
-                  />
-                  {deltaWidth > 0 && (
-                    <div
-                      className={`h-full transition-all duration-1000 ease-out animate-pulse ${
-                        myResult.elo_change > 0 ? "bg-green-500" : "bg-destructive"
-                      }`}
-                      style={{ width: `${deltaWidth}%` }}
-                    />
-                  )}
+        {/* Per-hero stats */}
+        {units.length > 0 && (
+          <section className="grid gap-4 md:grid-cols-2" style={fadeUp(0.5)}>
+            {[
+              { title: "Ваша команда", list: mine, tone: "text-emerald-300" },
+              { title: "Команда соперника", list: theirs, tone: "text-rose-300" },
+            ].map(({ title, list, tone }) => (
+              <div key={title} className="flex flex-col gap-2">
+                <div className="flex items-center justify-between px-1">
+                  <h3 className={cn("text-xs font-bold uppercase tracking-widest", tone)}>{title}</h3>
+                  <span className="text-[10px] text-muted-foreground">У/С · урон · получено · лечение</span>
                 </div>
-
-                {!pInfo.isMax && <RankBadge elo={pInfo.nextElo} size="sm" />}
+                {list.map((u) => (
+                  <HeroRow
+                    key={u.unit_id}
+                    unit={u}
+                    char={byId.get(u.char_id)}
+                    maxDamage={maxDamage}
+                    isMvp={u.unit_id === mvp}
+                  />
+                ))}
               </div>
+            ))}
+          </section>
+        )}
 
-              <div className="flex justify-between items-center text-[11px] text-muted-foreground px-1">
-                <span>{pInfo.currentRankInfo.title}</span>
-                {!pInfo.isMax && <span>{Math.round(newPercent)}% Пройдено</span>}
-                {!pInfo.isMax && <span>{pInfo.nextRankInfo.title}</span>}
-              </div>
-            </div>
-          </div>
-
-          <div className="flex justify-center">
-            <Button onClick={onReturnHome} size="lg" className="h-12 w-64 text-base font-bold">
-              Вернуться на базу
-            </Button>
-          </div>
-        </div>
+        {/* Actions */}
+        <footer className="mt-auto flex flex-col-reverse items-center justify-center gap-3 sm:flex-row" style={fadeUp(0.65)}>
+          <Button variant="outline" size="lg" onClick={onReturnHome} className="h-12 w-56 text-base font-bold">
+            <House className="h-4 w-4" />
+            В лобби
+          </Button>
+          <Button size="lg" onClick={onPlayAgain} className="h-12 w-56 text-base font-bold">
+            <RotateCcw className="h-4 w-4" />
+            Играть снова
+          </Button>
+        </footer>
       </div>
     </div>
   );

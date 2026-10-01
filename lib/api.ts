@@ -1,4 +1,4 @@
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+import { getApiBaseUrl } from "@/lib/utils";
 
 interface RequestOptions extends RequestInit {
   json?: any;
@@ -6,10 +6,60 @@ interface RequestOptions extends RequestInit {
   formData?: FormData;
 }
 
+// One in-flight refresh shared by every caller, so a burst of 401s (or a
+// socket reconnect racing an API call) rotates the refresh cookie only once.
+let refreshInflight: Promise<string | null> | null = null;
+
+// Exchange the HTTP-only refresh cookie for a new access token and store it.
+// Resolves to null when the server rejects the refresh (session is over);
+// rejects on network errors so callers can decide to retry.
+export function refreshAccessToken(): Promise<string | null> {
+  if (!refreshInflight) {
+    refreshInflight = (async () => {
+      const res = await fetch(`${getApiBaseUrl()}/auth/refresh`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      localStorage.setItem("token", data.access_token);
+      return data.access_token as string;
+    })().finally(() => {
+      refreshInflight = null;
+    });
+  }
+  return refreshInflight;
+}
+
+// A stored token is reused only if it stays valid at least this long.
+const TOKEN_MIN_TTL_SECONDS = 60;
+
+function tokenExpiresAt(token: string): number | null {
+  try {
+    const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const exp = JSON.parse(atob(payload)).exp;
+    return typeof exp === "number" ? exp : null;
+  } catch {
+    return null;
+  }
+}
+
+// The stored access token, refreshed first if it has (nearly) expired. For
+// callers the 401-retry in apiRequest can't cover — e.g. the match websocket,
+// which authenticates once, at connect time.
+export async function getFreshAccessToken(): Promise<string | null> {
+  const token = localStorage.getItem("token");
+  if (!token) return null;
+  const exp = tokenExpiresAt(token);
+  if (exp !== null && exp - Date.now() / 1000 > TOKEN_MIN_TTL_SECONDS) return token;
+  return refreshAccessToken();
+}
+
 export async function apiRequest(endpoint: string, options: RequestOptions = {}) {
   const { json, params, formData, headers, ...restOptions } = options;
 
-  let url = `${BASE_URL}${endpoint}`;
+  const baseUrl = getApiBaseUrl();
+  let url = `${baseUrl}${endpoint}`;
 
   if (params) {
     const searchParams = new URLSearchParams(params);
@@ -49,19 +99,12 @@ export async function apiRequest(endpoint: string, options: RequestOptions = {})
     // Intercept 401 for token refresh
     if (response.status === 401 && !url.includes("/auth/refresh") && !url.includes("/auth/login")) {
       try {
-        const refreshResponse = await fetch(`${BASE_URL}/auth/refresh`, {
-          method: "POST",
-          credentials: "include"
-        });
+        const newToken = await refreshAccessToken();
 
-        if (refreshResponse.ok) {
-          const data = await refreshResponse.json();
-          if (typeof window !== "undefined") {
-            localStorage.setItem("token", data.access_token);
-          }
+        if (newToken) {
           // Retry original request with new token
           if (config.headers) {
-             (config.headers as Record<string, string>)["Authorization"] = `Bearer ${data.access_token}`;
+             (config.headers as Record<string, string>)["Authorization"] = `Bearer ${newToken}`;
           }
           response = await fetch(url, config);
         } else {

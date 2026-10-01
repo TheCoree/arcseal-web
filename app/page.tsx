@@ -31,6 +31,9 @@ function DashboardContent() {
   const { user, updateProfile, refreshUser } = useAuth();
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [rankUpFromElo, setRankUpFromElo] = useState<number | null>(null);
+  // "Play again" chosen on the result screen: queue up once we're back in
+  // the lobby (after the rank-up animation, if one plays).
+  const [queueAfterResult, setQueueAfterResult] = useState(false);
 
   const match = useMatchSocket({
     userId: user?.id,
@@ -41,23 +44,30 @@ function DashboardContent() {
   // we tear down the result screen. We only intercept when the player actually
   // crossed a rank threshold upward — a loss that drops them a tier just
   // returns to lobby silently.
-  const handleReturnHome = () => {
+  const leaveResult = (playAgain: boolean) => {
+    match.returnHome();
+    if (playAgain) match.startSearch();
+  };
+
+  const handleReturnHome = (playAgain = false) => {
     const result = match.myResult;
     if (result && result.elo_change > 0) {
       const oldElo = result.new_elo - result.elo_change;
       const oldRank = getRankInfo(oldElo).title;
       const newRank = getRankInfo(result.new_elo).title;
       if (oldRank !== newRank) {
+        setQueueAfterResult(playAgain);
         setRankUpFromElo(oldElo);
         return;
       }
     }
-    match.returnHome();
+    leaveResult(playAgain);
   };
 
   const handleRankUpFinished = () => {
     setRankUpFromElo(null);
-    match.returnHome();
+    leaveResult(queueAfterResult);
+    setQueueAfterResult(false);
   };
 
   if (!user) return null;
@@ -72,8 +82,10 @@ function DashboardContent() {
           rightPlayer={match.rightPlayer}
           draft={match.draft}
           mySide={match.mySide}
+          turnClock={match.turnClock}
           onBan={match.banCharacter}
           onPick={match.pickCharacter}
+          onSurrender={match.surrender}
         />
       )}
 
@@ -83,17 +95,21 @@ function DashboardContent() {
           rightPlayer={match.rightPlayer}
           battle={match.battle}
           mySide={match.mySide}
+          turnClock={match.turnClock}
+          battleLog={match.battleLog}
+          eventBatch={match.eventBatch}
           opponentDisconnected={match.opponentDisconnected}
           procPulses={match.procPulses}
-          opponentInspect={match.opponentInspect}
+          opponentIntent={match.opponentIntent}
           telegraphs={match.telegraphs}
-          onInspect={match.sendInspect}
+          onIntent={match.sendIntent}
           actions={{
             activate: match.activateUnit,
             move: match.moveActiveUnit,
             attack: match.attackTarget,
             useAbility: match.useAbility,
             endTurn: match.endTurn,
+            surrender: match.surrender,
           }}
         />
       )}
@@ -102,9 +118,12 @@ function DashboardContent() {
         <ResultScreen
           me={match.mySide === "LEFT" ? match.leftPlayer : match.rightPlayer}
           opponent={match.mySide === "LEFT" ? match.rightPlayer : match.leftPlayer}
+          mySide={match.mySide}
           myResult={match.myResult}
           opponentResult={match.opponentResult}
-          onReturnHome={handleReturnHome}
+          finish={match.finishInfo}
+          onReturnHome={() => handleReturnHome(false)}
+          onPlayAgain={() => handleReturnHome(true)}
         />
       )}
 

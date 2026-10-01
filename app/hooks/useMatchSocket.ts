@@ -3,14 +3,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import { getFreshAccessToken } from "@/lib/api";
+import { getWsBaseUrl } from "@/lib/utils";
 import type {
+  BattleEvent,
   BattleSnapshot,
   DraftSnapshot,
+  FinishInfo,
   GameStage,
+  LoggedEvent,
   PlayerInfo,
   ResultData,
   ServerStage,
   Side,
+  TurnClock,
+  TurnTimerPayload,
 } from "@/app/components/game/types";
 
 interface UseMatchSocketArgs {
@@ -32,10 +39,19 @@ interface UseMatchSocketReturn {
   // Transient "this passive just fired" pulses, keyed by unit_id. `key` bumps
   // on every fresh proc so the UI can restart its flash animation.
   procPulses: Record<string, { name: string; key: number }>;
-  // unit_id the opponent is currently inspecting (or null).
-  opponentInspect: string | null;
+  // What the opponent is currently doing (or null when idle). Surfaced as a
+  // live "intent" banner so you can anticipate their next move.
+  opponentIntent: OpponentIntent | null;
   // Append-only feed of recent actions (attack/ability/passive) to telegraph.
   telegraphs: TelegraphEvent[];
+  // Whose-turn clock (draft and battle); null when nothing is ticking.
+  turnClock: TurnClock | null;
+  // Full battle log for this match, and the batch that arrived with the
+  // latest snapshot (drives movement animations).
+  battleLog: LoggedEvent[];
+  eventBatch: { key: number; events: BattleEvent[] } | null;
+  // How the finished match ended (reason, winner, per-hero stats).
+  finishInfo: FinishInfo | null;
   isConnected: boolean;
   startSearch: () => void;
   cancelSearch: () => void;
@@ -46,9 +62,22 @@ interface UseMatchSocketReturn {
   attackTarget: (targetUnitId: string) => void;
   useAbility: (target: { abilityId?: string; unitId?: string; unitId2?: string; zone?: number }) => void;
   endTurn: () => void;
+  surrender: () => void;
   returnHome: () => void;
-  // Tell the server which unit you're inspecting (relayed to the opponent).
-  sendInspect: (unitId: string | null) => void;
+  // Tell the server what you're currently doing (relayed to the opponent).
+  // Pass null when you stop / go idle.
+  sendIntent: (intent: OpponentIntent | null) => void;
+}
+
+// A live, cosmetic "what is the opponent doing right now" hint.
+// - inspect:   reading a hero's kit (unitId of the inspected unit)
+// - targeting: choosing a target for an attack/ability (abilityName = label)
+// - hover:     pointing at an ability they haven't committed to yet
+// - move:      choosing where to move
+export interface OpponentIntent {
+  kind: "inspect" | "targeting" | "hover" | "move";
+  unitId?: string | null;
+  abilityName?: string | null;
 }
 
 export interface TelegraphEvent {
@@ -90,11 +119,20 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
   const [opponentDisconnected, setOpponentDisconnected] = useState(false);
   const [procPulses, setProcPulses] = useState<Record<string, { name: string; key: number }>>({});
   const procKeyRef = useRef(0);
-  const [opponentInspect, setOpponentInspect] = useState<string | null>(null);
+  const [opponentIntent, setOpponentIntent] = useState<OpponentIntent | null>(null);
   const [telegraphs, setTelegraphs] = useState<TelegraphEvent[]>([]);
   const fxKeyRef = useRef(0);
+  const [turnClock, setTurnClock] = useState<TurnClock | null>(null);
+  const [battleLog, setBattleLog] = useState<LoggedEvent[]>([]);
+  const [eventBatch, setEventBatch] = useState<{ key: number; events: BattleEvent[] } | null>(null);
+  const logKeyRef = useRef(0);
+  const [finishInfo, setFinishInfo] = useState<FinishInfo | null>(null);
 
   const wsRef = useRef<TaggedWebSocket | null>(null);
+  // True while the hook is mounted with a user; guards connects that resolve
+  // (after an async token refresh) once the component has gone away.
+  const mountedRef = useRef(false);
+  const connectingRef = useRef(false);
   const searchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -144,6 +182,17 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
     setGameState(serverStageToClient(msg.stage as ServerStage));
     setDraft(msg.draft ?? null);
     setBattle(msg.battle ?? null);
+    // The server sends time *remaining* (its clock isn't ours); anchor it to
+    // the local clock on arrival.
+    const timer = msg.turn_timer as TurnTimerPayload | null | undefined;
+    setTurnClock(timer ? { deadline: Date.now() + timer.remaining_ms, seconds: timer.seconds } : null);
+    const events = (msg.events ?? []) as BattleEvent[];
+    if (events.length) {
+      setEventBatch({ key: ++logKeyRef.current, events });
+      setBattleLog((prev) =>
+        [...prev, ...events.map((event) => ({ key: ++logKeyRef.current, event }))].slice(-300),
+      );
+    }
     if (msg.stage !== "FINISHED") {
       // Stale FINISHED results stay rendered until the user dismisses.
       setOpponentDisconnected(false);
@@ -172,6 +221,9 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
             setMySide(msg.players.LEFT?.user_id === uid ? "LEFT" : "RIGHT");
           }
           setGameState(serverStageToClient(msg.stage as ServerStage));
+          setBattleLog([]);
+          setEventBatch(null);
+          setFinishInfo(null);
           break;
         case "ROOM_STATE":
           applyRoomState(msg);
@@ -215,8 +267,16 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
           }
           break;
         }
-        case "OPPONENT_INSPECT":
-          setOpponentInspect((msg.unit_id as string | null) ?? null);
+        case "OPPONENT_INTENT":
+          setOpponentIntent(
+            msg.intent
+              ? {
+                  kind: msg.intent as OpponentIntent["kind"],
+                  unitId: (msg.unit_id as string | null) ?? null,
+                  abilityName: (msg.ability_name as string | null) ?? null,
+                }
+              : null,
+          );
           break;
         case "RECONNECT":
           applyRoomState(msg);
@@ -237,6 +297,12 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
           break;
         case "GAME_FINISHED": {
           setGameState("FINISHED");
+          setTurnClock(null);
+          setFinishInfo({
+            reason: msg.reason ?? "score",
+            winner: msg.winner ?? null,
+            summary: msg.summary ?? { rounds: 0, units: [] },
+          });
           const uid = userIdRef.current;
           const computedMySide: Side =
             msg.players?.LEFT?.user_id === uid ? "LEFT" : "RIGHT";
@@ -256,14 +322,32 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
     [applyRoomState],
   );
 
-  const connect = useCallback(() => {
-    if (!userIdRef.current) return;
+  const connect = useCallback(async () => {
+    if (!userIdRef.current || !mountedRef.current) return;
     if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) return;
+    if (connectingRef.current) return;
 
-    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    if (!token) return;
+    // The socket authenticates once, at connect time. A reconnect after a
+    // network drop can happen long after login, so refresh an expired access
+    // token first — otherwise the server rejects it and the match is forfeited.
+    connectingRef.current = true;
+    let token: string | null;
+    try {
+      token = await getFreshAccessToken();
+    } catch {
+      // Network hiccup while refreshing: try with what we have; onclose retries.
+      token = localStorage.getItem("token");
+    } finally {
+      connectingRef.current = false;
+    }
+    if (!mountedRef.current || !userIdRef.current) return;
+    if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) return;
+    if (!token) {
+      toast.error("Сессия истекла. Войдите снова.", { id: "session-expired" });
+      return;
+    }
 
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/api/v1/ws";
+    const wsUrl = getWsBaseUrl();
     const ws = new WebSocket(`${wsUrl}/match?token=${token}`) as TaggedWebSocket;
 
     ws.onopen = () => {
@@ -300,7 +384,7 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null;
-        connect();
+        void connect();
       }, RECONNECT_DELAY_MS);
     };
 
@@ -309,8 +393,10 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
 
   useEffect(() => {
     if (!userId) return;
-    connect();
+    mountedRef.current = true;
+    void connect();
     return () => {
+      mountedRef.current = false;
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -338,7 +424,7 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
   const startSearch = useCallback(() => {
     if (!send({ type: "FIND_MATCH" })) {
       toast.error("Нет соединения с сервером. Попробуйте через секунду.");
-      connect();
+      void connect();
       return;
     }
     toast.info("Поиск рейтинговой игры начат.");
@@ -400,9 +486,18 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
     send({ type: "END_TURN" });
   }, [send]);
 
-  const sendInspect = useCallback(
-    (unitId: string | null) => {
-      send({ type: "INSPECT", unit_id: unitId });
+  const surrender = useCallback(() => {
+    send({ type: "SURRENDER" });
+  }, [send]);
+
+  const sendIntent = useCallback(
+    (intent: OpponentIntent | null) => {
+      send({
+        type: "INTENT",
+        intent: intent?.kind ?? null,
+        unit_id: intent?.unitId ?? null,
+        ability_name: intent?.abilityName ?? null,
+      });
     },
     [send],
   );
@@ -417,8 +512,12 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
     setMyResult(null);
     setOpponentResult(null);
     setOpponentDisconnected(false);
-    setOpponentInspect(null);
+    setOpponentIntent(null);
     setTelegraphs([]);
+    setTurnClock(null);
+    setBattleLog([]);
+    setEventBatch(null);
+    setFinishInfo(null);
   }, []);
 
   return {
@@ -433,8 +532,12 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
     opponentResult,
     opponentDisconnected,
     procPulses,
-    opponentInspect,
+    opponentIntent,
     telegraphs,
+    turnClock,
+    battleLog,
+    eventBatch,
+    finishInfo,
     isConnected,
     startSearch,
     cancelSearch,
@@ -445,7 +548,8 @@ export function useMatchSocket({ userId, onFinished }: UseMatchSocketArgs): UseM
     attackTarget,
     useAbility,
     endTurn,
+    surrender,
     returnHome,
-    sendInspect,
+    sendIntent,
   };
 }
