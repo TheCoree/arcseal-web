@@ -5,6 +5,8 @@ import React, { useMemo, useState } from "react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Input } from "@/components/ui/input";
 import { RankBadge } from "@/app/components/RankBadge";
+import { SurrenderButton } from "@/app/components/game/SurrenderButton";
+import { TurnTimer } from "@/app/components/game/TurnTimer";
 import { useCharacterRoster } from "@/app/hooks/useCharacterRoster";
 import { absolutizeMediaUrl, cn } from "@/lib/utils";
 import type {
@@ -12,6 +14,7 @@ import type {
   DraftSnapshot,
   PlayerInfo,
   Side,
+  TurnClock,
 } from "@/app/components/game/types";
 
 interface DraftScreenProps {
@@ -19,8 +22,10 @@ interface DraftScreenProps {
   rightPlayer: PlayerInfo | null;
   draft: DraftSnapshot;
   mySide: Side;
+  turnClock?: TurnClock | null;
   onBan: (charId: string) => void;
   onPick: (charId: string) => void;
+  onSurrender: () => void;
 }
 
 const ROLE_LABEL_RU: Record<string, string> = {
@@ -240,18 +245,26 @@ function PickSlots({
     <div className={cn("flex gap-2", align === "right" && "flex-row-reverse")}>
       {slots.map((id, i) => {
         const char = id ? roster.get(id) : null;
+        const portrait = char ? absolutizeMediaUrl(char.portrait_url ?? null) : null;
         return (
           <div
             key={i}
             className={cn(
-              "h-14 w-14 rounded-xl border flex flex-col items-center justify-center transition-all overflow-hidden",
+              "relative h-14 w-14 rounded-xl border flex flex-col items-center justify-center transition-all overflow-hidden",
               char
-                ? "border-foreground/40 bg-zinc-800/80"
+                ? "border-foreground/40 bg-zinc-800/80 animate-in zoom-in-75 fade-in-0 duration-300"
                 : "border-border/40 bg-muted/10 border-dashed",
             )}
             title={char?.name ?? "—"}
           >
-            {char ? (
+            {char && portrait ? (
+              <>
+                <img src={portrait} alt={char.name} className="absolute inset-0 h-full w-full object-cover" draggable={false} />
+                <span className="absolute inset-x-0 bottom-0 bg-black/65 text-[9px] text-center truncate px-0.5 text-zinc-100">
+                  {char.name.split(" ")[0]}
+                </span>
+              </>
+            ) : char ? (
               <>
                 <span className="text-lg font-black text-foreground">
                   {charInitial(char.name)}
@@ -327,8 +340,10 @@ export default function DraftScreen({
   rightPlayer,
   draft,
   mySide,
+  turnClock,
   onBan,
   onPick,
+  onSurrender,
 }: DraftScreenProps) {
   const { roster, byId, isLoading, error } = useCharacterRoster();
   const [query, setQuery] = useState("");
@@ -397,6 +412,11 @@ export default function DraftScreen({
           >
             {isMyTurn ? "Ваш ход" : "Ход соперника"}
           </span>
+          <TurnTimer
+            clock={turnClock ?? null}
+            mine={isMyTurn}
+            timeoutHint={draft.sub_stage === "BAN" ? "Забаним случайного!" : "Выберем случайного!"}
+          />
         </div>
 
         <PlayerHeader
@@ -461,6 +481,8 @@ export default function DraftScreen({
             align="left"
           />
         </div>
+        <div className="flex flex-col items-center gap-3">
+        <SurrenderButton onConfirm={onSurrender} />
         {draft.bans_enabled && (
           <div className="flex flex-col items-center gap-2">
             <span className="text-xs text-muted-foreground">Баны</span>
@@ -482,6 +504,7 @@ export default function DraftScreen({
             </div>
           </div>
         )}
+        </div>
         <div className="flex flex-col gap-2 items-end">
           <span className="text-xs text-muted-foreground">Команда соперника</span>
           <PickSlots
